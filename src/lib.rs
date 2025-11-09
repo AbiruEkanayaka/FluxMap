@@ -16,16 +16,15 @@
 
 use std::borrow::Borrow;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    
     Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
 use crossbeam_utils::CachePadded;
 use dashmap::DashSet; // Added for read_trackers
 use futures::stream::Stream;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 pub mod db;
 pub mod error;
@@ -114,15 +113,7 @@ enum InsertAction {
 
 impl<K, V> Default for SkipList<K, V>
 where
-    K: Ord
-        + Clone
-        + Send
-        + Sync
-        + 'static
-        + std::hash::Hash
-        + Eq
-        + Serialize
-        + DeserializeOwned,
+    K: Ord + Clone + Send + Sync + 'static + std::hash::Hash + Eq + Serialize + DeserializeOwned,
     V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned,
 {
     fn default() -> Self {
@@ -132,15 +123,7 @@ where
 
 impl<K, V> SkipList<K, V>
 where
-    K: Ord
-        + Clone
-        + Send
-        + Sync
-        + 'static
-        + std::hash::Hash
-        + Eq
-        + Serialize
-        + DeserializeOwned,
+    K: Ord + Clone + Send + Sync + 'static + std::hash::Hash + Eq + Serialize + DeserializeOwned,
     V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned,
 {
     /// Creates a new, empty `SkipList` with the default max level.
@@ -564,11 +547,14 @@ where
                     let mut attempts = 0;
                     loop {
                         attempts += 1;
-                        if attempts < 5 { // Spin for a few attempts
+                        if attempts < 5 {
+                            // Spin for a few attempts
                             std::thread::yield_now();
-                        } else { // Then yield to Tokio runtime with increasing delay
+                        } else {
+                            // Then yield to Tokio runtime with increasing delay
                             let delay_ms = 2u64.pow(attempts - 5); // Exponential delay
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms.min(100))).await; // Cap delay at 100ms
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms.min(100)))
+                                .await; // Cap delay at 100ms
                         }
                         // Break from the inner loop to let the outer loop re-run the whole insert logic.
                         break;
@@ -628,10 +614,9 @@ where
                 version_ptr.as_ref()
             } {
                 // Check if the version is visible to the current transaction.
-                let is_visible =
-                    transaction
-                        .snapshot
-                        .is_visible(&version_node.version, &*self.tx_manager);
+                let is_visible = transaction
+                    .snapshot
+                    .is_visible(&version_node.version, &*self.tx_manager);
 
                 if is_visible {
                     // This is a version we can try to expire.
@@ -719,7 +704,6 @@ where
         results
     }
 
-
     /// Returns a stream that yields visible key-value pairs within a given range.
     pub fn range_stream<'a>(
         &'a self,
@@ -777,8 +761,6 @@ where
             }
         }
     }
-
-
 }
 
 impl<K, V> SkipList<K, V>
@@ -912,8 +894,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::pin_mut;
     use futures::StreamExt;
+    use futures::pin_mut;
     use rand::{Rng, SeedableRng};
     use std::sync::Arc;
 
@@ -939,11 +921,7 @@ mod tests {
         // Writer Transaction
         let writer_tx = tx_manager.begin();
         skip_list
-            .insert(
-                "c".to_string(),
-                Arc::new("three".to_string()),
-                &writer_tx,
-            )
+            .insert("c".to_string(), Arc::new("three".to_string()), &writer_tx)
             .await;
         skip_list
             .insert("a".to_string(), Arc::new("one".to_string()), &writer_tx)
@@ -981,11 +959,7 @@ mod tests {
             .insert("a".to_string(), Arc::new("one".to_string()), &writer_tx)
             .await;
         skip_list
-            .insert(
-                "a".to_string(),
-                Arc::new("one_new".to_string()),
-                &writer_tx,
-            )
+            .insert("a".to_string(), Arc::new("one_new".to_string()), &writer_tx)
             .await; // Prepend new version
         tx_manager.commit(&writer_tx).unwrap();
 
@@ -1078,10 +1052,12 @@ mod tests {
         assert!(skip_list.get(&"b".to_string(), &reader_tx_1).is_some());
 
         let remover_tx_2 = tx_manager.begin();
-        assert!(skip_list
-            .remove(&"d".to_string(), &remover_tx_2)
-            .await
-            .is_none());
+        assert!(
+            skip_list
+                .remove(&"d".to_string(), &remover_tx_2)
+                .await
+                .is_none()
+        );
         assert_eq!(skip_list.len(), 3);
     }
 
@@ -1507,14 +1483,10 @@ mod tests {
         // leading to a final state where x=10 and y=10, and the sum is 20, violating the invariant.
 
         // Tx1 writes based on its read.
-        skip_list
-            .insert("x".to_string(), Arc::new(10), &tx1)
-            .await;
+        skip_list.insert("x".to_string(), Arc::new(10), &tx1).await;
 
         // Tx2 writes based on its read.
-        skip_list
-            .insert("y".to_string(), Arc::new(10), &tx2)
-            .await;
+        skip_list.insert("y".to_string(), Arc::new(10), &tx2).await;
 
         // Now, attempt to commit both. One must fail.
         let commit1_result = tx_manager.commit(&tx1);
@@ -1565,20 +1537,14 @@ mod tests {
 
         // Tx1: Insert x=10, y=20
         let tx1 = tx_manager.begin();
-        skip_list
-            .insert("x".to_string(), Arc::new(10), &tx1)
-            .await;
-        skip_list
-            .insert("y".to_string(), Arc::new(20), &tx1)
-            .await;
+        skip_list.insert("x".to_string(), Arc::new(10), &tx1).await;
+        skip_list.insert("y".to_string(), Arc::new(20), &tx1).await;
         tx_manager.commit(&tx1).unwrap();
 
         // Tx2: Delete x, Update y to 30
         let tx2 = tx_manager.begin();
         skip_list.remove(&"x".to_string(), &tx2).await;
-        skip_list
-            .insert("y".to_string(), Arc::new(30), &tx2)
-            .await; // This prepends a new version, does not expire the old one.
+        skip_list.insert("y".to_string(), Arc::new(30), &tx2).await; // This prepends a new version, does not expire the old one.
         tx_manager.commit(&tx2).unwrap();
 
         // Run vacuum. Only the version of `x` was explicitly removed.
@@ -1599,9 +1565,7 @@ mod tests {
         // --- Test multiple dead versions for the same key ---
         // Create a situation with multiple expired versions for a single key 'z'
         let tx3 = tx_manager.begin();
-        skip_list
-            .insert("z".to_string(), Arc::new(1), &tx3)
-            .await;
+        skip_list.insert("z".to_string(), Arc::new(1), &tx3).await;
         tx_manager.commit(&tx3).unwrap();
 
         let tx4 = tx_manager.begin();
@@ -1609,9 +1573,7 @@ mod tests {
         tx_manager.commit(&tx4).unwrap();
 
         let tx5 = tx_manager.begin();
-        skip_list
-            .insert("z".to_string(), Arc::new(2), &tx5)
-            .await;
+        skip_list.insert("z".to_string(), Arc::new(2), &tx5).await;
         tx_manager.commit(&tx5).unwrap();
 
         let tx6 = tx_manager.begin();
@@ -1619,9 +1581,7 @@ mod tests {
         tx_manager.commit(&tx6).unwrap();
 
         let tx7 = tx_manager.begin();
-        skip_list
-            .insert("z".to_string(), Arc::new(3), &tx7)
-            .await; // Current visible version
+        skip_list.insert("z".to_string(), Arc::new(3), &tx7).await; // Current visible version
         tx_manager.commit(&tx7).unwrap();
 
         // The version chain for 'z' is now 3 -> 2(expired) -> 1(expired)
@@ -1641,9 +1601,7 @@ mod tests {
 
         // Tx1: Insert "a"
         let tx1 = tx_manager.begin();
-        skip_list
-            .insert("a".to_string(), Arc::new(1), &tx1)
-            .await;
+        skip_list.insert("a".to_string(), Arc::new(1), &tx1).await;
         tx_manager.commit(&tx1).unwrap();
 
         // Tx2: Remove "a"
@@ -1680,9 +1638,7 @@ mod tests {
 
         // Tx1: Insert "a" with value 1
         let tx1 = tx_manager.begin();
-        skip_list
-            .insert("a".to_string(), Arc::new(1), &tx1)
-            .await;
+        skip_list.insert("a".to_string(), Arc::new(1), &tx1).await;
         tx_manager.commit(&tx1).unwrap();
 
         // Tx2 (Updater): Start a transaction to update "a" to 2, but DON'T commit yet.
@@ -1740,9 +1696,7 @@ mod tests {
 
         // Tx1: Insert "a" with value 1 and commit.
         let tx1 = tx_manager.begin();
-        skip_list
-            .insert("a".to_string(), Arc::new(1), &tx1)
-            .await;
+        skip_list.insert("a".to_string(), Arc::new(1), &tx1).await;
         tx_manager.commit(&tx1).unwrap();
 
         // Tx2: Remove "a" but DO NOT commit yet.
@@ -1755,12 +1709,24 @@ mod tests {
         // because tx2_expirer is still active.
         let (versions_removed_before_commit, keys_removed_before_commit) =
             skip_list.vacuum().await.unwrap();
-        assert_eq!(versions_removed_before_commit, 0, "No versions should be removed by vacuum before expirer commits");
-        assert_eq!(keys_removed_before_commit, 0, "No keys should be removed by vacuum before expirer commits");
+        assert_eq!(
+            versions_removed_before_commit, 0,
+            "No versions should be removed by vacuum before expirer commits"
+        );
+        assert_eq!(
+            keys_removed_before_commit, 0,
+            "No keys should be removed by vacuum before expirer commits"
+        );
 
         // Verify that "a" is still visible to an old snapshot (if any) or not visible to new ones.
         let reader_tx_before_commit = tx_manager.begin();
-        assert_eq!(*skip_list.get(&"a".to_string(), &reader_tx_before_commit).unwrap(), 1, "Key 'a' should still be visible with its original value to a new reader before expirer commits.");
+        assert_eq!(
+            *skip_list
+                .get(&"a".to_string(), &reader_tx_before_commit)
+                .unwrap(),
+            1,
+            "Key 'a' should still be visible with its original value to a new reader before expirer commits."
+        );
 
         // Commit tx2_expirer. Now the version expired by tx2 is truly dead.
         tx_manager.commit(&tx2_expirer).unwrap();
@@ -1768,8 +1734,14 @@ mod tests {
         // Run vacuum again. Now it SHOULD remove the version.
         let (versions_removed_after_commit, keys_removed_after_commit) =
             skip_list.vacuum().await.unwrap();
-        assert_eq!(versions_removed_after_commit, 1, "One version should be removed by vacuum after expirer commits");
-        assert_eq!(keys_removed_after_commit, 1, "One key should be removed by vacuum after expirer commits");
+        assert_eq!(
+            versions_removed_after_commit, 1,
+            "One version should be removed by vacuum after expirer commits"
+        );
+        assert_eq!(
+            keys_removed_after_commit, 1,
+            "One key should be removed by vacuum after expirer commits"
+        );
 
         // Verify "a" is still gone.
         let final_reader_tx = tx_manager.begin();
@@ -1803,7 +1775,6 @@ mod tests {
         // We expect some versions/keys to be removed if there were any logical deletions.
         // For this test, we just care about status pruning.
 
-
         // After vacuum, the `statuses` map should be pruned.
         // The number of statuses should be significantly less than the initial count,
         // ideally close to 0 if no active transactions remain and all versions are gone.
@@ -1811,7 +1782,13 @@ mod tests {
         // The `min_retainable_txid` will be the current `next_txid` if no active transactions.
         // So, only statuses for transactions >= `min_retainable_txid` should remain.
         // In this simple case, it should be very small, possibly 0 or 1 (for the next_txid itself).
-        assert!(final_status_count < initial_status_count, "Transaction statuses should have been pruned.");
-        assert!(final_status_count <= 1, "Expected very few statuses remaining after pruning."); // Should be 0 or 1 (for the next_txid)
+        assert!(
+            final_status_count < initial_status_count,
+            "Transaction statuses should have been pruned."
+        );
+        assert!(
+            final_status_count <= 1,
+            "Expected very few statuses remaining after pruning."
+        ); // Should be 0 or 1 (for the next_txid)
     }
 }

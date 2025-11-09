@@ -46,4 +46,3 @@ impl From<io::Error> for FluxError {
         FluxError::PersistenceError(err.to_string())
     }
 }
-

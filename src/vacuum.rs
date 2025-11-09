@@ -6,7 +6,7 @@
 
 use crate::SkipList;
 use crate::transaction::TransactionStatus;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::sync::atomic::Ordering;
 
 impl<K, V> SkipList<K, V>
@@ -146,7 +146,9 @@ where
 
         // After vacuuming the skip list, update the minimum retainable TXID
         // and prune old transaction statuses from the manager.
-        tx_manager.min_retainable_txid.store(vacuum_horizon, Ordering::Release);
+        tx_manager
+            .min_retainable_txid
+            .store(vacuum_horizon, Ordering::Release);
         tx_manager.prune_statuses();
 
         Ok((versions_removed, keys_removed_count))

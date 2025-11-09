@@ -70,11 +70,11 @@
 //! # }
 //! ```
 
+use crate::SkipList;
 use crate::error::FluxError;
 use crate::persistence::{DurabilityLevel, PersistenceEngine};
-use crate::SkipList;
 use crate::transaction::Transaction;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

@@ -22,10 +22,10 @@
 //!     replays any subsequent WAL segments to restore the database to its last known
 //!     consistent state.
 
-use crate::transaction::Workspace;
 use crate::SkipList;
-use rustix::fs::fallocate;
+use crate::transaction::Workspace;
 use rustix::fs::FallocateFlags;
+use rustix::fs::fallocate;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -33,8 +33,9 @@ use std::io::{self, BufReader, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::{
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc,
 };
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -98,12 +99,10 @@ impl Clone for WalSegment {
 
 /// A snapshot of the database state at a specific point in time.
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(
-    bound(
-        serialize = "K: Eq + std::hash::Hash + Serialize, V: Serialize",
-        deserialize = "K: Eq + std::hash::Hash + Deserialize<'de>, V: Deserialize<'de>"
-    )
-)]
+#[serde(bound(
+    serialize = "K: Eq + std::hash::Hash + Serialize, V: Serialize",
+    deserialize = "K: Eq + std::hash::Hash + Deserialize<'de>, V: Deserialize<'de>"
+))]
 struct SnapshotData<K, V> {
     /// The index of the last WAL segment that was successfully incorporated into this snapshot.
     last_processed_segment_idx: Option<usize>,
@@ -172,7 +171,15 @@ fn setup_wal_files(wal_path: &PathBuf) -> io::Result<Vec<WalSegment>> {
 
 impl<K, V> PersistenceEngine<K, V>
 where
-    K: Ord + Clone + Send + Sync + 'static + std::hash::Hash + Eq + Serialize + for<'de> Deserialize<'de>,
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + std::hash::Hash
+        + Eq
+        + Serialize
+        + for<'de> Deserialize<'de>,
     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de>,
 {
     /// Creates a new `PersistenceEngine` based on the provided `DurabilityLevel`.
@@ -271,10 +278,7 @@ where
                 ciborium::into_writer(&snapshot_data, tmp_file).unwrap();
 
                 // Fsync and rename
-                File::open(&tmp_snapshot_path)
-                    .unwrap()
-                    .sync_all()
-                    .unwrap();
+                File::open(&tmp_snapshot_path).unwrap().sync_all().unwrap();
                 fs::rename(&tmp_snapshot_path, &snapshot_path_clone).unwrap();
 
                 // 5. Truncate the WAL file to mark it as free.
@@ -374,7 +378,11 @@ where
         let replay_order_indices: Vec<usize> = if let Some(last_idx) = last_snap_idx {
             if let Some(pos) = wal_files.iter().position(|(idx, _, _)| *idx == last_idx) {
                 // Replay all files that were modified after the one in the snapshot
-                wal_files.iter().skip(pos + 1).map(|(idx, _, _)| *idx).collect()
+                wal_files
+                    .iter()
+                    .skip(pos + 1)
+                    .map(|(idx, _, _)| *idx)
+                    .collect()
             } else {
                 // Snapshot refers to a WAL that's now empty/gone, so replay everything
                 wal_files.iter().map(|(idx, _, _)| *idx).collect()
@@ -483,8 +491,7 @@ where
 
         // Reset writer position and update current segment index
         self.writer_position.store(0, Ordering::Relaxed);
-        self.current_segment_idx
-            .store(next_idx, Ordering::Relaxed);
+        self.current_segment_idx.store(next_idx, Ordering::Relaxed);
 
         // Truncate the new segment file before using it
         let segment = &self.wal_segments[next_idx];
@@ -636,7 +643,8 @@ mod tests {
 
         // Instead of checking the channel, wait for wal.0 to become Available
         let mut wal0_available = false;
-        for _ in 0..100 { // Try for a bit
+        for _ in 0..100 {
+            // Try for a bit
             let state = engine.wal_segments[0].state.lock().unwrap();
             if *state == WalSegmentState::Available {
                 wal0_available = true;
@@ -644,7 +652,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(wal0_available, "wal.0 did not become Available after rotation");
+        assert!(
+            wal0_available,
+            "wal.0 did not become Available after rotation"
+        );
     }
 
     #[test]
@@ -694,7 +705,8 @@ mod tests {
         let data = vec![0u8; data_size];
 
         // Fill all segments and trigger rotations
-        for _i in 0..WAL_POOL_SIZE * 2 { // Trigger more rotations than segments
+        for _i in 0..WAL_POOL_SIZE * 2 {
+            // Trigger more rotations than segments
             engine.log(&data).unwrap();
             // After each log, the current segment might be full, triggering a rotation.
             // The snapshotter should eventually free up segments.
@@ -713,7 +725,8 @@ mod tests {
         // Check that all segments eventually become available (or are in Writing state)
         // This is a more robust check than just asserting the final index.
         let mut all_available_or_writing = false;
-        for _ in 0..100 { // Try for a bit
+        for _ in 0..100 {
+            // Try for a bit
             all_available_or_writing = true;
             for i in 0..WAL_POOL_SIZE {
                 let state = engine.wal_segments[i].state.lock().unwrap();
@@ -727,6 +740,9 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(all_available_or_writing, "Not all segments became available or writing");
+        assert!(
+            all_available_or_writing,
+            "Not all segments became available or writing"
+        );
     }
 }
