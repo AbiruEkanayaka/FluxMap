@@ -1,5 +1,6 @@
 //! Defines the error types used throughout FluxMap.
 use std::fmt;
+use std::io;
 
 /// The primary error enum for all fallible operations in FluxMap.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,3 +40,10 @@ impl fmt::Display for FluxError {
 }
 
 impl std::error::Error for FluxError {}
+
+impl From<io::Error> for FluxError {
+    fn from(err: io::Error) -> Self {
+        FluxError::PersistenceError(err.to_string())
+    }
+}
+

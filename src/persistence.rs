@@ -24,7 +24,6 @@
 
 use crate::transaction::Workspace;
 use crate::SkipList;
-use anyhow::Result;
 use rustix::fs::fallocate;
 use rustix::fs::FallocateFlags;
 use serde::{Deserialize, Serialize};
@@ -34,7 +33,7 @@ use std::io::{self, BufReader, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
 };
 use std::thread::JoinHandle;
@@ -133,16 +132,17 @@ pub struct PersistenceEngine<K, V> {
     wal_segments: Vec<WalSegment>,
     current_segment_idx: Arc<AtomicUsize>,
     writer_position: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
     // A channel to send completed segments to the snapshotter
     snapshot_queue_tx: mpsc::Sender<usize>,
-    snapshot_queue_rx: Arc<Mutex<mpsc::Receiver<usize>>>,
+    _snapshot_queue_rx: Arc<Mutex<mpsc::Receiver<usize>>>,
     // Handles for our background threads
-    flusher_handle: Option<JoinHandle<()>>,
-    snapshotter_handle: Option<JoinHandle<()>>,
+    _flusher_handle: Option<JoinHandle<()>>,
+    _snapshotter_handle: Option<JoinHandle<()>>,
     _phantom: PhantomData<(K, V)>,
 }
 
-fn setup_wal_files(wal_path: &PathBuf) -> Result<Vec<WalSegment>> {
+fn setup_wal_files(wal_path: &PathBuf) -> io::Result<Vec<WalSegment>> {
     fs::create_dir_all(wal_path)?;
     let mut wal_segments = Vec::with_capacity(WAL_POOL_SIZE);
     for i in 0..WAL_POOL_SIZE {
@@ -179,7 +179,7 @@ where
     ///
     /// If the level is `InMemory`, it returns `Ok(None)`.
     /// Otherwise, it initializes the WAL files and starts the necessary background threads.
-    pub fn new(config: DurabilityLevel) -> Result<Option<Self>> {
+    pub fn new(config: DurabilityLevel) -> io::Result<Option<Self>> {
         if let DurabilityLevel::InMemory = &config {
             return Ok(None);
         }
@@ -195,6 +195,7 @@ where
         let (tx, rx) = mpsc::channel();
         let snapshot_queue_rx = Arc::new(Mutex::new(rx));
         let current_segment_idx = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         // --- Snapshotter Thread ---
         // This thread waits for filled WAL segments, applies them to a new snapshot,
@@ -203,13 +204,24 @@ where
         let rx_clone_snap = Arc::clone(&snapshot_queue_rx);
         let snapshot_path_clone = snapshot_path.clone();
         let wal_path_clone = wal_path.clone();
+        let shutdown_clone_snap = Arc::clone(&shutdown);
         let snapshotter_handle = std::thread::spawn(move || {
-            // The thread will panic if the channel is disconnected, which is fine.
-            loop {
+            while !shutdown_clone_snap.load(Ordering::Relaxed) {
                 let segment_idx = {
                     let rx = rx_clone_snap.lock().unwrap();
-                    rx.recv().unwrap()
-                }; // Lock on rx_clone_snap is released here
+                    match rx.try_recv() {
+                        Ok(idx) => idx,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            // No message, wait a bit and check shutdown flag again
+                            std::thread::sleep(Duration::from_millis(50));
+                            continue;
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            // Channel disconnected, time to shut down
+                            return;
+                        }
+                    }
+                };
 
                 let segment: &WalSegment = &segments_clone_snap[segment_idx];
 
@@ -286,8 +298,9 @@ where
             let segments_clone_flush = wal_segments.clone();
             let current_idx_clone_flush = Arc::clone(&current_segment_idx);
             let flush_interval_clone = *flush_interval;
+            let shutdown_clone_flush = Arc::clone(&shutdown);
             Some(std::thread::spawn(move || {
-                loop {
+                while !shutdown_clone_flush.load(Ordering::Relaxed) {
                     std::thread::sleep(flush_interval_clone);
                     let idx = current_idx_clone_flush.load(Ordering::Relaxed);
                     let segment = &segments_clone_flush[idx];
@@ -307,10 +320,11 @@ where
             wal_segments,
             current_segment_idx,
             writer_position: Arc::new(AtomicU64::new(0)),
+            shutdown,
             snapshot_queue_tx: tx,
-            snapshot_queue_rx,
-            flusher_handle,
-            snapshotter_handle: Some(snapshotter_handle),
+            _snapshot_queue_rx: snapshot_queue_rx,
+            _flusher_handle: flusher_handle,
+            _snapshotter_handle: Some(snapshotter_handle),
             _phantom: PhantomData,
         }))
     }
@@ -323,7 +337,7 @@ where
     /// 3. Replaying the records from those WAL segments in order.
     ///
     /// The resulting `SkipList` contains the fully recovered state.
-    pub async fn recover(&self) -> Result<SkipList<K, V>> {
+    pub async fn recover(&self) -> Result<SkipList<K, V>, crate::error::FluxError> {
         let skiplist = SkipList::new();
         let tx_manager = skiplist.transaction_manager();
 
@@ -483,6 +497,19 @@ where
     }
 }
 
+impl<K, V> Drop for PersistenceEngine<K, V> {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        if let Some(handle) = self._flusher_handle.take() {
+            handle.join().unwrap();
+        }
+        if let Some(handle) = self._snapshotter_handle.take() {
+            handle.join().unwrap();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,7 +661,7 @@ mod tests {
         let engine = PersistenceEngine::<String, String>::new(config)
             .unwrap()
             .unwrap();
-        assert!(engine.flusher_handle.is_some());
+        assert!(engine._flusher_handle.is_some());
 
         // Write some data. In relaxed mode, this only writes to the OS buffer.
         let data = b"some data to be flushed";
@@ -661,7 +688,7 @@ mod tests {
         let engine = PersistenceEngine::<String, String>::new(config)
             .unwrap()
             .unwrap();
-        assert!(engine.snapshotter_handle.is_some());
+        assert!(engine._snapshotter_handle.is_some());
 
         let data_size = (WAL_SEGMENT_SIZE_BYTES / 2) as usize; // Half a segment
         let data = vec![0u8; data_size];
@@ -703,4 +730,3 @@ mod tests {
         assert!(all_available_or_writing, "Not all segments became available or writing");
     }
 }
-

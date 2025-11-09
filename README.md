@@ -80,16 +80,16 @@ async fn main() -> Result<(), FluxError> {
     handle.insert("bob".to_string(), 100).await;
 
     // Atomically transfer 20 from Alice to Bob
-    let result = handle.transaction(|h| Box::pin(async move {
-        let alice_balance = h.get(&"alice".to_string()).unwrap_or(Arc::new(0));
-        let bob_balance = h.get(&"bob".to_string()).unwrap_or(Arc::new(0));
+    let result: Result<&str, FluxError> = handle.transaction(|h| Box::pin(async move {
+        let alice_balance = h.get(&"alice".to_string()).unwrap();
+        let bob_balance = h.get(&"bob".to_string()).unwrap();
 
         if *alice_balance >= 20 {
             h.insert("alice".to_string(), *alice_balance - 20).await;
             h.insert("bob".to_string(), *bob_balance + 20).await;
             Ok("Transfer successful!")
         } else {
-            Err("Insufficient funds!") // Returning an Err will automatically roll back
+            Err(FluxError::PersistenceError("Insufficient funds!".to_string())) // Returning an Err will automatically roll back
         }
     })).await;
 

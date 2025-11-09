@@ -6,7 +6,6 @@
 
 use crate::SkipList;
 use crate::transaction::TransactionStatus;
-use anyhow::Result;
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::atomic::Ordering;
 
@@ -42,7 +41,7 @@ where
     /// # Returns
     ///
     /// A `Result` containing a tuple of `(versions_removed, keys_removed)`.
-    pub async fn vacuum(&self) -> Result<(usize, usize)> {
+    pub async fn vacuum(&self) -> Result<(usize, usize), ()> {
         let tx_manager = self.transaction_manager();
 
         // 1. Find the vacuum horizon. This is the oldest active transaction ID.
