@@ -1,0 +1,30 @@
+[package]
+name = "fluxmap"
+version = "0.1.0"
+edition = "2024"
+authors = ["Abiru Ekanayaka <abiruekanayaka5@gmail.com>"]
+description = "A thread-safe, transactional, and concurrent in-memory key-value store for Rust. Offers ACID guarantees with Serializable Snapshot Isolation (SSI) and optional durability via a Write-Ahead Log (WAL). Designed for ease of use, high performance, and modern async Rust."
+license = "MIT"
+repository = "https://github.com/AbiruEkanayaka/FluxMap"
+readme = "README.md"
+keywords = ["rust", "db"]
+categories = ["db"]
+documentation = "https://docs.rs/fluxmap"
+
+[dependencies]
+anyhow = "1.0"
+async-stream = "0.3"
+crossbeam-epoch = "0.9"
+crossbeam-utils = "0.8"
+dashmap = "5.5.1"
+futures = "0.3"
+fastrand = "2"
+rustix = { version = "0.38", features = ["fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+ciborium = "0.2.2"
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"
+tempfile = "3.10"
