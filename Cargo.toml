@@ -7,7 +7,7 @@ description = "A thread-safe, transactional, and concurrent in-memory key-value 
 license = "MIT"
 repository = "https://github.com/AbiruEkanayaka/FluxMap"
 readme = "README.md"
-keywords = ["map", "set", "skiplist", "lock-free", "mvcc", "ssi", "wal"]
+keywords = ["map", "skiplist", "lock-free", "mvcc", "wal"]
 categories = ["algorithms", "concurrency", "data-structures", "database"]
 documentation = "https://docs.rs/fluxmap"
 
