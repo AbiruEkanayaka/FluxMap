@@ -32,7 +32,7 @@ First, add FluxMap to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-fluxmap = "0.1.0" # Replace with the latest version
+fluxmap = "0.2.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
