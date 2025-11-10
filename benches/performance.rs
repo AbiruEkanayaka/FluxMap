@@ -1,9 +1,11 @@
 use criterion::{
-    black_box, criterion_group, criterion_main, AxisScale, BenchmarkId, Criterion, PlotConfiguration,
-    Throughput,
+    black_box, criterion_group, criterion_main, AxisScale, BenchmarkId, Criterion,
+    PlotConfiguration, Throughput,
 };
 use fluxmap::db::Database;
 use rand::prelude::{Rng, SeedableRng};
+use rand::rngs::StdRng;
+use rand::RngCore;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::Barrier;
@@ -47,7 +49,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
                         let db_clone = db.clone();
                         let barrier_clone = barrier.clone();
                         let handle = tokio::spawn(async move {
-                            let mut rng = SeedableRng::seed_from_u64(i as u64);
+                            let mut rng = StdRng::seed_from_u64(i as u64);
                             barrier_clone.wait().await;
                             let db_handle = db_clone.handle();
                             for _ in 0..ops_per_task {
@@ -96,12 +98,12 @@ fn bench_concurrent_writes(c: &mut Criterion) {
                         let db_clone = db.clone();
                         let barrier_clone = barrier.clone();
                         let handle = tokio::spawn(async move {
-                            let mut rng = SeedableRng::seed_from_u64(i as u64);
+                            let mut rng = StdRng::seed_from_u64(i as u64);
                             barrier_clone.wait().await;
                             let db_handle = db_clone.handle();
                             for _ in 0..ops_per_task {
                                 let key = rng.gen_range(0..DATASET_SIZE);
-                                let value = rng.gen();
+                                let value = rng.next_u64();
                                 black_box(db_handle.insert(key, value).await.unwrap());
                             }
                         });
@@ -145,7 +147,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
                         let db_clone = db.clone();
                         let barrier_clone = barrier.clone();
                         let handle = tokio::spawn(async move {
-                            let mut rng = SeedableRng::seed_from_u64(i as u64);
+                            let mut rng = StdRng::seed_from_u64(i as u64);
                             barrier_clone.wait().await;
                             let db_handle = db_clone.handle();
                             for _ in 0..ops_per_task {
@@ -155,7 +157,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
                                     black_box(db_handle.get(&key));
                                 } else {
                                     // 20% writes
-                                    let value = rng.gen();
+                                    let value = rng.next_u64();
                                     black_box(db_handle.insert(key, value).await.unwrap());
                                 }
                             }

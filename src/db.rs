@@ -381,23 +381,7 @@ where
             Err(FluxError::EvictionError) // No victim found
         }
     }
-}
 
-impl<K, V> Database<K, V>
-where
-    K: Ord
-        + Clone
-        + Send
-        + Sync
-        + 'static
-        + std::hash::Hash
-        + Eq
-        + Serialize
-        + for<'de> Deserialize<'de>
-        + std::borrow::Borrow<str>
-        + MemSize,
-    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
-{
     /// Creates a new `DatabaseBuilder` to configure and build a `Database`.
     pub fn builder() -> DatabaseBuilder<K, V> {
         DatabaseBuilder::default()
@@ -643,7 +627,7 @@ where
 
             // In autocommit, we write directly to the skiplist's pending versions.
             self.skiplist.insert(key, Arc::new(value), &tx).await;
-            tx_manager.commit(&tx).unwrap();
+            tx_manager.commit(&tx)?;
             self.db.evict_if_needed().await;
         }
         Ok(())
@@ -712,7 +696,7 @@ where
             }
 
             let result = self.skiplist.remove(key, &tx).await;
-            tx_manager.commit(&tx).unwrap();
+            tx_manager.commit(&tx)?;
             Ok(result)
         }
     }
@@ -952,7 +936,7 @@ where
     /// ```
     pub async fn transaction<F, T, E>(&mut self, f: F) -> Result<T, E>
     where
-        F: for<'a> FnOnce(&'a mut Self) -> Pin<Box<dyn Future<Output = Result<T, E>> + 'a>>,
+        F: for<'a> FnOnce(&'a mut Self) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>,
         E: From<FluxError>,
     {
         self.begin()?;

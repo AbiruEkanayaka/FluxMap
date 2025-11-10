@@ -25,6 +25,10 @@ serde = { version = "1.0.228", features = ["derive", "rc"] }
 ciborium = "0.2.2"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = { version = "0.5", features = ["async_tokio"] }
 rand = "0.8"
 tempfile = "3.10"
+
+[[bench]]
+name = "performance"
+harness = false
