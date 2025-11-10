@@ -15,11 +15,13 @@ It is designed for ease of use, high performance, and seamless integration into 
 -   **ACID Transactions:** Guarantees atomicity, consistency, isolation, and durability.
 -   **Serializable Snapshot Isolation (SSI):** The strongest MVCC isolation level, protecting against phantom reads, write skew, and other subtle anomalies.
 -   **Concurrent & Thread-Safe:** Built for modern `async` Rust. The `Database` can be safely shared across threads using `Arc`.
--   **Optional Durability:**
+-   **Configurable Durability:**
     -   **In-Memory:** For maximum performance when data persistence is not required.
     -   **Durable (WAL):** Use a Write-Ahead Log for durability. Choose between:
         -   `Relaxed`: (Group Commit) Commits are buffered and flushed periodically for high throughput.
         -   `Full`: (fsync-per-transaction) Commits are flushed to disk before acknowledging, ensuring maximum safety.
+-   **Configurable Maintenance:**
+    -   **Automatic Vacuuming:** Optional background thread to automatically clean up old data versions and reclaim memory.
 -   **High Performance:** A lock-free skiplist implementation provides excellent performance for reads and low-contention writes.
 -   **Ergonomic API:** A clean and simple API for `get`, `insert`, and `remove` operations. Supports both simple autocommit operations and explicit, multi-statement transactions.
 -   **Range & Prefix Scans:** Efficiently query ranges of keys or keys with a specific prefix, with both `Vec` and `Stream`-based APIs.
@@ -44,14 +46,14 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    // Create a new in-memory database.
-    let db: Arc<Database<String, String>> = Arc::new(Database::new_in_memory());
+    // Create a new in-memory database using the builder.
+    let db: Arc<Database<String, String>> = Arc::new(Database::builder().build().await.unwrap());
 
     // Create a handle to interact with the database.
     let handle = db.handle();
 
     // Insert a key-value pair. This is an autocommit operation.
-    handle.insert("hello".to_string(), "world".to_string()).await;
+    handle.insert("hello".to_string(), "world".to_string()).await.unwrap();
 
     // Retrieve the value.
     let value = handle.get(&"hello".to_string()).unwrap();
@@ -72,12 +74,12 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), FluxError> {
-    let db: Arc<Database<String, i32>> = Arc::new(Database::new_in_memory());
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
     let mut handle = db.handle();
 
     // Account balances
-    handle.insert("alice".to_string(), 100).await;
-    handle.insert("bob".to_string(), 100).await;
+    handle.insert("alice".to_string(), 100).await?;
+    handle.insert("bob".to_string(), 100).await?;
 
     // Atomically transfer 20 from Alice to Bob
     let result: Result<&str, FluxError> = handle.transaction(|h| Box::pin(async move {
@@ -85,8 +87,8 @@ async fn main() -> Result<(), FluxError> {
         let bob_balance = h.get(&"bob".to_string()).unwrap();
 
         if *alice_balance >= 20 {
-            h.insert("alice".to_string(), *alice_balance - 20).await;
-            h.insert("bob".to_string(), *bob_balance + 20).await;
+            h.insert("alice".to_string(), *alice_balance - 20).await?;
+            h.insert("bob".to_string(), *bob_balance + 20).await?;
             Ok("Transfer successful!")
         } else {
             Err(FluxError::PersistenceError("Insufficient funds!".to_string())) // Returning an Err will automatically roll back
@@ -112,11 +114,10 @@ async fn main() -> Result<(), FluxError> {
 
 ### Example 3: Durable Database with WAL
 
-To persist data to disk, configure a `DurabilityLevel`.
+To persist data to disk, configure a durability level using the builder.
 
 ```rust
-use fluxmap::db::Database;
-use fluxmap::persistence::DurabilityLevel;
+use fluxmap::{db::Database, persistence::PersistenceOptions};
 use std::sync::Arc;
 use tempfile::tempdir; // For a temporary directory in this example
 
@@ -127,12 +128,17 @@ async fn main() {
     let wal_path = temp_dir.path().to_path_buf();
 
     // Configure the database for full durability.
-    let config = DurabilityLevel::Full { wal_path: wal_path.clone() };
-    let db: Arc<Database<String, i32>> = Arc::new(Database::new(config).await.unwrap());
+    let db: Arc<Database<String, i32>> = Arc::new(
+        Database::builder()
+            .durability_full(PersistenceOptions::new(wal_path.clone()))
+            .build()
+            .await
+            .unwrap(),
+    );
 
     // Insert data
     let mut handle = db.handle();
-    handle.insert("persistent_key".to_string(), 123).await;
+    handle.insert("persistent_key".to_string(), 123).await.unwrap();
     drop(handle);
     drop(db); // Simulate a shutdown
 
@@ -140,8 +146,13 @@ async fn main() {
 
     // Create a new database instance pointing to the same directory.
     // It will automatically recover the data from the WAL.
-    let new_config = DurabilityLevel::Full { wal_path };
-    let recovered_db: Arc<Database<String, i32>> = Arc::new(Database::new(new_config).await.unwrap());
+    let recovered_db: Arc<Database<String, i32>> = Arc::new(
+        Database::builder()
+            .durability_full(PersistenceOptions::new(wal_path))
+            .build()
+            .await
+            .unwrap(),
+    );
     let recovered_handle = recovered_db.handle();
 
     // The data is still there!
@@ -152,6 +163,42 @@ async fn main() {
 ```
 
 ## Core Concepts
+
+### Configuration
+
+The `Database` is configured using the builder pattern, which provides a flexible way to set durability and maintenance options.
+
+```rust
+use fluxmap::{
+    db::{Database, VacuumOptions},
+    persistence::PersistenceOptions,
+};
+use std::time::Duration;
+# use tempfile::tempdir;
+
+# #[tokio::main]
+# async fn main() {
+# let temp_dir = tempdir().unwrap();
+# let wal_path = temp_dir.path().to_path_buf();
+// A durable database with relaxed (group commit) durability and auto-vacuuming.
+let db = Database::<String, String>::builder()
+    .durability_relaxed(PersistenceOptions {
+        wal_path,
+        wal_pool_size: 4,
+        wal_segment_size_bytes: 16 * 1024 * 1024, // 16MB per segment
+    })
+    // Flush when the first of these conditions is met:
+    .flush_interval(Duration::from_secs(1))         // 1. After 1 second has passed
+    .flush_after_commits(1000)                      // 2. After 1000 commits
+    .flush_after_bytes(8 * 1024 * 1024)             // 3. After 8MB of data is written
+    .auto_vacuum(VacuumOptions {
+        interval: Duration::from_secs(30), // Run vacuum every 30 seconds
+    })
+    .build()
+    .await
+    .unwrap();
+# }
+```
 
 ### Database and Handle
 
@@ -169,11 +216,15 @@ FluxMap supports two modes of operation:
 
 ### Durability Levels
 
-You can control the trade-off between performance and safety using `DurabilityLevel`:
+You can control the trade-off between performance and safety by configuring durability via the `DatabaseBuilder`.
 
--   **`DurabilityLevel::InMemory`**: The default. No data is written to disk.
--   **`DurabilityLevel::Relaxed { wal_path, flush_interval }`**: (Group Commit) Commits are written to the OS buffer and a background thread flushes them to disk periodically. This offers good performance and durability against process crashes, but recent commits may be lost in case of an OS crash or power failure.
--   **`DurabilityLevel::Full { wal_path }`**: (fsync-per-transaction) Each transaction is fully synced to the disk before the `commit` call returns. This provides the strongest durability guarantee but has a higher performance overhead.
+-   **`InMemory`**: The default. No data is written to disk.
+-   **`Relaxed`**: (Group Commit) Commits are written to the OS buffer and a background thread flushes them to disk when the first of several conditions is met (e.g., time elapsed, number of commits, or bytes written). This offers high performance and durability against process crashes, but recent commits may be lost in case of an OS crash or power failure.
+-   **`Full`**: (fsync-per-transaction) Each transaction is fully synced to the disk before the `commit` call returns. This provides the strongest durability guarantee but has a higher performance overhead.
+
+### Automatic Vacuuming
+
+When configured via `auto_vacuum` on the builder, the database will spawn a background thread to periodically run the vacuum process. This reclaims memory from old, dead data versions. If not enabled, you can still call `db.vacuum()` manually.
 
 ## Under the Hood: MVCC and SSI
 

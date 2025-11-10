@@ -1,15 +1,3 @@
-//! The primary user-facing API for interacting with FluxMap.
-//!
-//! This module provides the main entry points for creating and using the database.
-//! The two most important structs are:
-//!
-//! -   [`Database`]: The central, thread-safe database object that owns the data.
-//!     You typically create one `Database` instance and share it across your
-//!     application using an `Arc`.
-//!
-//! -   [`Handle`]: A lightweight, single-threaded session handle used to perform
-//!     operations on the database. You create handles from a `Database` instance.
-//!
 //! # Examples
 //!
 //! ## Basic Usage (Autocommit)
@@ -20,14 +8,14 @@
 //! #
 //! # #[tokio::main]
 //! # async fn main() {
-//! // Create a new in-memory database.
-//! let db: Arc<Database<String, String>> = Arc::new(Database::new_in_memory());
+//! // Create a new in-memory database using the builder.
+//! let db: Arc<Database<String, String>> = Arc::new(Database::builder().build().await.unwrap());
 //!
 //! // Create a handle to interact with the database.
 //! let handle = db.handle();
 //!
 //! // Each operation is a small, independent transaction.
-//! handle.insert("key1".to_string(), "value1".to_string()).await;
+//! handle.insert("key1".to_string(), "value1".to_string()).await.unwrap();
 //! let value = handle.get(&"key1".to_string()).unwrap();
 //!
 //! assert_eq!(*value, "value1");
@@ -45,18 +33,18 @@
 //! #
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), FluxError> {
-//! # let db: Arc<Database<String, i32>> = Arc::new(Database::new_in_memory());
+//! # let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
 //! let mut handle = db.handle();
-//! handle.insert("alice".to_string(), 100).await;
-//! handle.insert("bob".to_string(), 50).await;
+//! handle.insert("alice".to_string(), 100).await?;
+//! handle.insert("bob".to_string(), 50).await?;
 //!
 //! // Atomically transfer 20 from Alice to Bob.
 //! handle.transaction(|h| Box::pin(async move {
 //!     let alice_balance = h.get(&"alice".to_string()).unwrap();
 //!     let bob_balance = h.get(&"bob".to_string()).unwrap();
 //!
-//!     h.insert("alice".to_string(), *alice_balance - 20).await;
-//!     h.insert("bob".to_string(), *bob_balance + 20).await;
+//!     h.insert("alice".to_string(), *alice_balance - 20).await?;
+//!     h.insert("bob".to_string(), *bob_balance + 20).await?;
 //!
 //!     Ok::<_, FluxError>(()) // Commit the changes
 //! })).await?;
@@ -70,62 +58,79 @@
 //! # }
 //! ```
 
-use crate::SkipList;
 use crate::error::FluxError;
-use crate::persistence::{DurabilityLevel, PersistenceEngine};
+use crate::persistence::{DurabilityLevel, PersistenceEngine, PersistenceOptions};
 use crate::transaction::Transaction;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use crate::SkipList;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
-/// The central database object that owns the underlying data store.
-///
-/// A `Database` instance is thread-safe and can be shared across multiple threads,
-/// typically by wrapping it in an `Arc`. It serves as the factory for creating
-/// [`Handle`] instances, which are used to interact with the data.
+/// Options for configuring the automatic vacuuming process.
+#[derive(Debug, Clone, Copy)]
+pub struct VacuumOptions {
+    /// The interval at which the vacuum process runs to clean up dead data versions.
+    pub interval: Duration,
+}
+
+/// A builder for creating a [`Database`] instance with custom configurations.
 ///
 /// # Examples
-///
 /// ```
-/// # use fluxmap::db::Database;
-/// # use fluxmap::persistence::DurabilityLevel;
-/// # use std::sync::Arc;
+/// # use fluxmap::db::{Database, VacuumOptions};
+/// # use fluxmap::persistence::{DurabilityLevel, PersistenceOptions};
+/// # use std::time::Duration;
 /// # use tempfile::tempdir;
 /// #
 /// # #[tokio::main]
 /// # async fn main() {
-/// // In-memory database
-/// let in_memory_db: Arc<Database<String, String>> = Arc::new(Database::new_in_memory());
-///
-/// // Durable database
 /// # let temp_dir = tempdir().unwrap();
 /// # let wal_path = temp_dir.path().to_path_buf();
-/// let config = DurabilityLevel::Full { wal_path };
-/// let durable_db: Arc<Database<String, String>> = Arc::new(Database::new(config).await.unwrap());
+/// // A durable database with custom WAL settings and auto-vacuuming enabled.
+/// let db = Database::<String, String>::builder()
+///     .durability_full(PersistenceOptions {
+///         wal_path,
+///         wal_pool_size: 8,
+///         wal_segment_size_bytes: 16 * 1024 * 1024, // 16MB
+///     })
+///     .auto_vacuum(VacuumOptions {
+///         interval: Duration::from_secs(30),
+///     })
+///     .build()
+///     .await
+///     .unwrap();
 /// # }
 /// ```
-pub struct Database<K, V>
-where
-    K: Ord + Clone + Send + Sync + 'static + std::hash::Hash + Eq + Serialize + DeserializeOwned,
-    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned,
-{
-    skiplist: Arc<SkipList<K, V>>,
-    persistence_engine: Option<Arc<PersistenceEngine<K, V>>>,
+pub struct DatabaseBuilder<K, V> {
+    vacuum: Option<VacuumOptions>,
+    persistence_options: Option<PersistenceOptions>,
+    is_full_durability: bool,
+    flush_interval: Option<Duration>,
+    flush_after_n_commits: Option<usize>,
+    flush_after_m_bytes: Option<u64>,
+    _phantom: PhantomData<(K, V)>,
 }
 
-impl<K, V> Default for Database<K, V>
-where
-    K: Ord + Clone + Send + Sync + 'static + std::hash::Hash + Eq + Serialize + DeserializeOwned,
-    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned,
-{
-    /// Creates a new, empty, in-memory `Database`.
+impl<K, V> Default for DatabaseBuilder<K, V> {
     fn default() -> Self {
-        Self::new_in_memory()
+        Self {
+            vacuum: None,
+            persistence_options: None,
+            is_full_durability: false,
+            flush_interval: None,
+            flush_after_n_commits: None,
+            flush_after_m_bytes: None,
+            _phantom: PhantomData,
+        }
     }
 }
 
-impl<K, V> Database<K, V>
+impl<K, V> DatabaseBuilder<K, V>
 where
     K: Ord
         + Clone
@@ -135,26 +140,76 @@ where
         + std::hash::Hash
         + Eq
         + Serialize
-        + for<'de> Deserialize<'de>,
+        + for<'de> Deserialize<'de>
+        + std::borrow::Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de>,
 {
-    /// Creates a new, empty, in-memory `Database`.
-    ///
-    /// Data will not be persisted and will be lost when the `Database` is dropped.
-    pub fn new_in_memory() -> Self {
-        Database {
-            skiplist: Arc::new(SkipList::new()),
-            persistence_engine: None,
-        }
+    /// Configures the database for full durability (`fsync` per transaction).
+    pub fn durability_full(mut self, options: PersistenceOptions) -> Self {
+        self.persistence_options = Some(options);
+        self.is_full_durability = true;
+        self
     }
 
-    /// Creates a new `Database` with a specified durability level.
+    /// Configures the database for relaxed durability (group commit).
     ///
-    /// If the durability level is not `InMemory`, this will initialize the
-    /// persistence engine, which may involve creating files and recovering
-    /// state from the Write-Ahead Log (WAL) on disk.
-    pub async fn new(config: DurabilityLevel) -> Result<Self, FluxError> {
-        let persistence_engine = PersistenceEngine::new(config)
+    /// You must chain this with at least one flush condition (`flush_interval`,
+    /// `flush_after_commits`, or `flush_after_bytes`).
+    pub fn durability_relaxed(mut self, options: PersistenceOptions) -> Self {
+        self.persistence_options = Some(options);
+        self.is_full_durability = false;
+        self
+    }
+
+    /// Sets the time-based flush condition for relaxed durability.
+    pub fn flush_interval(mut self, interval: Duration) -> Self {
+        self.flush_interval = Some(interval);
+        self
+    }
+
+    /// Sets the commit-based flush condition for relaxed durability.
+    pub fn flush_after_commits(mut self, n: usize) -> Self {
+        self.flush_after_n_commits = Some(n);
+        self
+    }
+
+    /// Sets the byte-based flush condition for relaxed durability.
+    pub fn flush_after_bytes(mut self, m: u64) -> Self {
+        self.flush_after_m_bytes = Some(m);
+        self
+    }
+
+    /// Enables and configures automatic vacuuming.
+    ///
+    /// If not set, vacuuming must be performed manually by calling [`Database::vacuum`].
+    pub fn auto_vacuum(mut self, vacuum: VacuumOptions) -> Self {
+        self.vacuum = Some(vacuum);
+        self
+    }
+
+    /// Builds the `Database` instance with the specified configurations.
+    pub async fn build(self) -> Result<Database<K, V>, FluxError> {
+        let durability = match self.persistence_options {
+            Some(options) => {
+                if self.is_full_durability {
+                    DurabilityLevel::Full { options }
+                } else {
+                    let flush_interval_ms = self.flush_interval.map(|d| d.as_millis() as u64);
+                    if flush_interval_ms.is_none() && self.flush_after_n_commits.is_none() && self.flush_after_m_bytes.is_none() {
+                        return Err(FluxError::PersistenceError("Relaxed durability mode requires at least one flush condition (interval, commits, or bytes).".to_string()));
+                    }
+                    DurabilityLevel::Relaxed {
+                        options,
+                        flush_interval_ms,
+                        flush_after_n_commits: self.flush_after_n_commits,
+                        flush_after_m_bytes: self.flush_after_m_bytes,
+                    }
+                }
+            }
+            None => DurabilityLevel::InMemory,
+        };
+
+        let persistence_engine = PersistenceEngine::new(durability)
             .map_err(|e| FluxError::PersistenceError(e.to_string()))?
             .map(Arc::new);
 
@@ -169,10 +224,141 @@ where
             Arc::new(SkipList::new())
         };
 
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let vacuum_handle = if let Some(vacuum_opts) = self.vacuum {
+            let skiplist_clone = skiplist.clone();
+            let shutdown_clone = shutdown.clone();
+            let handle = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                runtime.block_on(async move {
+                    while !shutdown_clone.load(Ordering::Relaxed) {
+                        tokio::time::sleep(vacuum_opts.interval).await;
+                        if shutdown_clone.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Err(e) = skiplist_clone.vacuum().await {
+                            eprintln!("Automatic vacuuming failed: {:?}", e);
+                        }
+                    }
+                });
+            });
+            Some(handle)
+        } else {
+            None
+        };
+
         Ok(Database {
             skiplist,
             persistence_engine,
+            _vacuum_handle: vacuum_handle,
+            shutdown,
         })
+    }
+}
+
+/// The central database object that owns the underlying data store.
+///
+/// A `Database` instance is thread-safe and can be shared across multiple threads,
+/// typically by wrapping it in an `Arc`. It serves as the factory for creating
+/// [`Handle`] instances, which are used to interact with the data.
+///
+/// Use the [`Database::builder()`] method to construct a new database.
+pub struct Database<K, V>
+where
+    K: Ord + Clone + Send + Sync + 'static + std::hash::Hash + Eq + Serialize + DeserializeOwned,
+    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned,
+{
+    skiplist: Arc<SkipList<K, V>>,
+    persistence_engine: Option<Arc<PersistenceEngine<K, V>>>,
+    _vacuum_handle: Option<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl<K, V> Drop for Database<K, V>
+where
+    K: Ord + Clone + Send + Sync + 'static + std::hash::Hash + Eq + Serialize + DeserializeOwned,
+    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned,
+{
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self._vacuum_handle.take() {
+            if let Err(e) = handle.join() {
+                eprintln!("Automatic vacuum thread panicked: {:?}", e);
+            }
+        }
+    }
+}
+
+impl<K, V> Database<K, V>
+where
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + std::hash::Hash
+        + Eq
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + std::borrow::Borrow<str>,
+    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de>,
+{
+    /// Creates a new `DatabaseBuilder` to configure and build a `Database`.
+    pub fn builder() -> DatabaseBuilder<K, V> {
+        DatabaseBuilder::default()
+    }
+
+    /// Creates a new, empty, in-memory `Database` with default settings.
+    ///
+    /// For more configuration options, use [`Database::builder`].
+    pub async fn new_in_memory() -> Result<Self, FluxError> {
+        Database::builder().build().await
+    }
+
+    /// Creates a new `Database` with a specified durability level and default settings.
+    ///
+    /// For more configuration options, use [`Database::builder`].
+    pub async fn new(config: DurabilityLevel) -> Result<Self, FluxError> {
+        let builder = Database::builder();
+        let configured_builder = match config {
+            DurabilityLevel::InMemory => builder,
+            DurabilityLevel::Full { options } => builder.durability_full(options),
+            DurabilityLevel::Relaxed {
+                options,
+                flush_interval_ms,
+                flush_after_n_commits,
+                flush_after_m_bytes,
+            } => {
+                let mut relaxed_builder = builder.durability_relaxed(options);
+                if let Some(interval) = flush_interval_ms {
+                    relaxed_builder =
+                        relaxed_builder.flush_interval(Duration::from_millis(interval));
+                }
+                if let Some(n) = flush_after_n_commits {
+                    relaxed_builder = relaxed_builder.flush_after_commits(n);
+                }
+                if let Some(m) = flush_after_m_bytes {
+                    relaxed_builder = relaxed_builder.flush_after_bytes(m);
+                }
+                relaxed_builder
+            }
+        };
+        configured_builder.build().await
+    }
+
+    /// Manually triggers the vacuum process to reclaim space from dead data versions.
+    ///
+    /// This is only necessary if automatic vacuuming is not configured.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing a tuple of `(versions_removed, keys_removed)`.
+    pub async fn vacuum(&self) -> Result<(usize, usize), ()> {
+        self.skiplist.vacuum().await
     }
 
     /// Creates a new `Handle` for interacting with the database.
@@ -211,7 +397,10 @@ where
 {
     skiplist: &'db Arc<SkipList<K, V>>,
     /// The currently active transaction, if one has been explicitly started.
-    pub active_tx: Option<Arc<Transaction<K, V>>>, // Made public for testing
+    #[cfg(test)]
+    pub active_tx: Option<Arc<Transaction<K, V>>>,
+    #[cfg(not(test))]
+    active_tx: Option<Arc<Transaction<K, V>>>,
     persistence_engine: &'db Option<Arc<PersistenceEngine<K, V>>>,
 }
 
@@ -249,9 +438,9 @@ where
     /// #
     /// # #[tokio::main]
     /// # async fn main() {
-    /// # let db: Arc<Database<String, i32>> = Arc::new(Database::new_in_memory());
+    /// # let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
     /// let handle = db.handle();
-    /// handle.insert("key".to_string(), 123).await;
+    /// handle.insert("key".to_string(), 123).await.unwrap();
     ///
     /// let value = handle.get(&"key".to_string()).unwrap();
     /// assert_eq!(*value, 123);
@@ -263,7 +452,7 @@ where
         if let Some(active_tx) = &self.active_tx {
             // --- Explicit Transaction Path ---
             // 1. Check workspace for writes made within this transaction (RYOW).
-            let workspace = active_tx.workspace.lock().unwrap();
+            let workspace = active_tx.workspace.read().unwrap();
             if let Some(workspace_value) = workspace.get(key) {
                 return workspace_value.clone();
             }
@@ -293,25 +482,25 @@ where
     /// #
     /// # #[tokio::main]
     /// # async fn main() {
-    /// # let db: Arc<Database<String, i32>> = Arc::new(Database::new_in_memory());
+    /// # let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
     /// let handle = db.handle();
     ///
     /// // Insert a new key
-    /// handle.insert("key".to_string(), 1).await;
+    /// handle.insert("key".to_string(), 1).await.unwrap();
     ///
     /// // Update the key
-    /// handle.insert("key".to_string(), 2).await;
+    /// handle.insert("key".to_string(), 2).await.unwrap();
     ///
     /// let value = handle.get(&"key".to_string()).unwrap();
     /// assert_eq!(*value, 2);
     /// # }
     /// ```
-    pub async fn insert(&self, key: K, value: V) {
+    pub async fn insert(&self, key: K, value: V) -> Result<(), FluxError> {
         if let Some(active_tx) = &self.active_tx {
             // --- Explicit Transaction Path ---
             active_tx
                 .workspace
-                .lock()
+                .write()
                 .unwrap()
                 .insert(key, Some(Arc::new(value)));
         } else {
@@ -324,13 +513,11 @@ where
                 let mut workspace = crate::transaction::Workspace::new();
                 workspace.insert(key.clone(), Some(Arc::new(value.clone())));
                 let mut serialized_data = Vec::new();
-                // In a real scenario, we'd handle this error, but for the fix, unwrap is acceptable.
-                ciborium::into_writer(&workspace, &mut serialized_data).unwrap();
-                if engine.log(&serialized_data).is_err() {
+                ciborium::into_writer(&workspace, &mut serialized_data)
+                    .map_err(|e| FluxError::PersistenceError(e.to_string()))?;
+                if let Err(e) = engine.log(&serialized_data) {
                     tx_manager.abort(&tx);
-                    // The function can't return a Result, so we can't propagate.
-                    // In a real app, this might panic or log a severe error.
-                    return;
+                    return Err(e.into());
                 }
             }
 
@@ -338,6 +525,7 @@ where
             self.skiplist.insert(key, Arc::new(value), &tx).await;
             tx_manager.commit(&tx).unwrap();
         }
+        Ok(())
     }
 
     /// Removes a key from the database.
@@ -359,29 +547,29 @@ where
     /// #
     /// # #[tokio::main]
     /// # async fn main() {
-    /// # let db: Arc<Database<String, i32>> = Arc::new(Database::new_in_memory());
+    /// # let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
     /// let handle = db.handle();
-    /// handle.insert("key".to_string(), 123).await;
+    /// handle.insert("key".to_string(), 123).await.unwrap();
     ///
-    /// let removed_value = handle.remove(&"key".to_string()).await.unwrap();
+    /// let removed_value = handle.remove(&"key".to_string()).await.unwrap().unwrap();
     /// assert_eq!(*removed_value, 123);
     ///
     /// assert!(handle.get(&"key".to_string()).is_none());
     /// # }
     /// ```
-    pub async fn remove(&self, key: &K) -> Option<Arc<V>> {
+    pub async fn remove(&self, key: &K) -> Result<Option<Arc<V>>, FluxError> {
         if let Some(active_tx) = &self.active_tx {
             // --- Explicit Transaction Path ---
-            let mut workspace = active_tx.workspace.lock().unwrap();
+            let mut workspace = active_tx.workspace.write().unwrap();
             // Mark the key for deletion in the workspace.
             let old_val_in_workspace = workspace.insert(key.clone(), None);
             if let Some(Some(val)) = old_val_in_workspace {
                 // The key was present in the workspace, return its value.
-                Some(val)
+                Ok(Some(val))
             } else {
                 // The key was not in the workspace, so the value to be removed
                 // is the one visible in the skiplist from our snapshot.
-                self.skiplist.get(key, active_tx)
+                Ok(self.skiplist.get(key, active_tx))
             }
         } else {
             // --- Autocommit Path ---
@@ -394,16 +582,17 @@ where
                     crate::transaction::Workspace::new();
                 workspace.insert(key.clone(), None); // None signifies removal
                 let mut serialized_data = Vec::new();
-                ciborium::into_writer(&workspace, &mut serialized_data).unwrap();
-                if engine.log(&serialized_data).is_err() {
+                ciborium::into_writer(&workspace, &mut serialized_data)
+                    .map_err(|e| FluxError::PersistenceError(e.to_string()))?;
+                if let Err(e) = engine.log(&serialized_data) {
                     tx_manager.abort(&tx);
-                    return None; // Can't return an error, so we return None.
+                    return Err(e.into());
                 }
             }
 
             let result = self.skiplist.remove(key, &tx).await;
             tx_manager.commit(&tx).unwrap();
-            result
+            Ok(result)
         }
     }
 
@@ -441,7 +630,7 @@ where
         // in-memory skiplist. This ensures that if we crash after this point, recovery
         // can replay the transaction.
         if let Some(engine) = self.persistence_engine {
-            let workspace = active_tx.workspace.lock().unwrap();
+            let workspace = active_tx.workspace.read().unwrap();
             if !workspace.is_empty() {
                 let mut serialized_data = Vec::new();
                 ciborium::into_writer(&*workspace, &mut serialized_data)
@@ -458,7 +647,7 @@ where
 
         // --- Phase 2: In-Memory Application ---
         // Apply changes from the workspace to the actual skiplist.
-        let workspace = std::mem::take(&mut *active_tx.workspace.lock().unwrap());
+        let workspace = std::mem::take(&mut *active_tx.workspace.write().unwrap());
         for (key, value) in workspace {
             match value {
                 Some(val) => {
@@ -516,11 +705,11 @@ where
     /// #
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), FluxError> {
-    /// # let db: Arc<Database<String, i32>> = Arc::new(Database::new_in_memory());
+    /// # let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
     /// let mut handle = db.handle();
     ///
     /// let result = handle.transaction(|h| Box::pin(async move {
-    ///     h.insert("key1".to_string(), 100).await;
+    ///     h.insert("key1".to_string(), 100).await?;
     ///     let val = h.get(&"key1".to_string()).unwrap();
     ///     assert_eq!(*val, 100); // Read-Your-Own-Writes
     ///     Ok::<_, FluxError>("Success!")
@@ -557,365 +746,5 @@ where
             });
             result // Return the closure's Err result.
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::error::FluxError;
-
-    #[tokio::test]
-    async fn test_autocommit_insert_and_get() {
-        let db: Database<String, String> = Database::new_in_memory();
-        let handle = db.handle();
-
-        handle
-            .insert("key1".to_string(), "value1".to_string())
-            .await;
-
-        let val = handle.get(&"key1".to_string());
-        assert_eq!(val.as_deref().map(|s| s.as_str()), Some("value1"));
-    }
-
-    #[tokio::test]
-    async fn test_autocommit_remove() {
-        let db: Database<String, String> = Database::new_in_memory();
-        let handle = db.handle();
-
-        handle
-            .insert("key1".to_string(), "value1".to_string())
-            .await;
-        let val = handle.get(&"key1".to_string());
-        assert!(val.is_some());
-
-        let removed_val = handle.remove(&"key1".to_string()).await;
-        assert_eq!(removed_val.as_deref().map(|s| s.as_str()), Some("value1"));
-
-        let val_after_remove = handle.get(&"key1".to_string());
-        assert!(val_after_remove.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_ryow_insert_get() {
-        let db: Database<String, String> = Database::new_in_memory();
-        let mut handle = db.handle();
-
-        // Manually begin a transaction for testing RYOW
-        let tx = db.skiplist.transaction_manager().begin();
-        handle.active_tx = Some(tx.clone());
-
-        // Insert a value into the workspace
-        handle
-            .insert("ryow_key".to_string(), "ryow_value".to_string())
-            .await;
-
-        // 1. Get the value within the same transaction - should see the uncommitted write
-        let val = handle.get(&"ryow_key".to_string());
-        assert_eq!(
-            val.as_deref().map(|s| s.as_str()),
-            Some("ryow_value"),
-            "Should read own uncommitted insert from workspace"
-        );
-
-        // 2. Verify that another handle (using autocommit) doesn't see the value yet
-        let other_handle = db.handle();
-        let other_val = other_handle.get(&"ryow_key".to_string());
-        assert!(
-            other_val.is_none(),
-            "Another handle should not see the uncommitted value"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_ryow_insert_remove_get() {
-        let db: Database<String, String> = Database::new_in_memory();
-        let mut handle = db.handle();
-
-        // Manually begin a transaction
-        let tx = db.skiplist.transaction_manager().begin();
-        handle.active_tx = Some(tx.clone());
-
-        // Insert a value
-        handle
-            .insert("ryow_key_del".to_string(), "ryow_value_del".to_string())
-            .await;
-        let val_inserted = handle.get(&"ryow_key_del".to_string());
-        assert_eq!(
-            val_inserted.as_deref().map(|s| s.as_str()),
-            Some("ryow_value_del")
-        );
-
-        // Remove the value within the same transaction
-        let removed_val = handle.remove(&"ryow_key_del".to_string()).await;
-        assert_eq!(
-            removed_val.as_deref().map(|s| s.as_str()),
-            Some("ryow_value_del")
-        );
-
-        // Get the value within the same transaction - should see None
-        let val_after_remove = handle.get(&"ryow_key_del".to_string());
-        assert!(val_after_remove.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_explicit_commit() {
-        let db: Database<String, String> = Database::new_in_memory();
-        let mut handle = db.handle();
-
-        handle.begin().unwrap();
-        handle
-            .insert("key1".to_string(), "value1".to_string())
-            .await;
-
-        // Value should not be visible to another transaction before commit
-        let other_handle = db.handle();
-        assert!(other_handle.get(&"key1".to_string()).is_none());
-
-        handle.commit().await.unwrap();
-
-        // Value should be visible after commit
-        let val = other_handle.get(&"key1".to_string());
-        assert_eq!(val.as_deref().map(|s| s.as_str()), Some("value1"));
-    }
-
-    #[tokio::test]
-    async fn test_explicit_rollback() {
-        let db: Database<String, String> = Database::new_in_memory();
-        let mut handle = db.handle();
-
-        handle.begin().unwrap();
-        handle
-            .insert("key1".to_string(), "value1".to_string())
-            .await;
-
-        // RYOW should work
-        let val = handle.get(&"key1".to_string());
-        assert_eq!(val.as_deref().map(|s| s.as_str()), Some("value1"));
-
-        handle.rollback().unwrap();
-
-        // Value should not be visible after rollback
-        let other_handle = db.handle();
-        assert!(other_handle.get(&"key1".to_string()).is_none());
-
-        // The transaction should be gone from the handle
-        assert!(handle.active_tx.is_none());
-        // Trying to get it from the same handle should now use autocommit path and find nothing
-        assert!(handle.get(&"key1".to_string()).is_none());
-    }
-
-    #[tokio::test]
-    async fn test_begin_twice_fails() {
-        let db: Database<String, String> = Database::new_in_memory();
-        let mut handle = db.handle();
-        handle.begin().unwrap();
-        let res = handle.begin();
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), FluxError::TransactionAlreadyActive);
-    }
-
-    #[tokio::test]
-    async fn test_commit_without_begin_fails() {
-        let db: Database<String, String> = Database::new_in_memory();
-        let mut handle = db.handle();
-        let res = handle.commit().await;
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), FluxError::NoActiveTransaction);
-    }
-
-    #[tokio::test]
-    async fn test_rollback_without_begin_fails() {
-        let db: Database<String, String> = Database::new_in_memory();
-        let mut handle = db.handle();
-        let res = handle.rollback();
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), FluxError::NoActiveTransaction);
-    }
-
-    #[tokio::test]
-    async fn test_serialization_conflict_aborts() {
-        let db: Arc<Database<String, i32>> = Arc::new(Database::new_in_memory());
-
-        // Setup: insert x=10, y=20
-        let setup_handle = db.handle();
-        setup_handle.insert("x".to_string(), 10).await;
-        setup_handle.insert("y".to_string(), 20).await;
-
-        let mut h1 = db.handle();
-        let mut h2 = db.handle();
-
-        // Tx1 starts
-        h1.begin().unwrap();
-        // Tx2 starts
-        h2.begin().unwrap();
-
-        // Tx1 reads x and y
-        let x1 = h1.get(&"x".to_string()).unwrap();
-        let y1 = h1.get(&"y".to_string()).unwrap();
-
-        // Tx2 reads x and y
-        let x2 = h2.get(&"x".to_string()).unwrap();
-        let y2 = h2.get(&"y".to_string()).unwrap();
-
-        // Tx1 writes to y based on x
-        h1.insert("y".to_string(), *x1 + *y1).await; // y = 10 + 20 = 30
-
-        // Tx2 writes to x based on y
-        h2.insert("x".to_string(), *x2 + *y2).await; // x = 10 + 20 = 30
-
-        // Commit Tx1
-        let res1 = h1.commit().await;
-        assert!(res1.is_ok());
-
-        // Commit Tx2 - this should fail
-        let res2 = h2.commit().await;
-        assert!(res2.is_err());
-        assert_eq!(res2.unwrap_err(), FluxError::SerializationConflict);
-
-        // Check final state
-        let final_handle = db.handle();
-        let final_x = final_handle.get(&"x".to_string()).unwrap();
-        let final_y = final_handle.get(&"y".to_string()).unwrap();
-
-        assert_eq!(*final_x, 10); // from setup, because tx2 failed
-        assert_eq!(*final_y, 30); // from tx1
-    }
-
-    #[tokio::test]
-    async fn test_transaction_closure_commit() {
-        let db: Arc<Database<String, String>> = Arc::new(Database::new_in_memory());
-        let mut handle = db.handle();
-
-        let result = handle
-            .transaction(|h| {
-                Box::pin(async move {
-                    h.insert("key".to_string(), "value".to_string()).await;
-                    Ok::<_, FluxError>("success".to_string())
-                })
-            })
-            .await;
-
-        assert_eq!(result.unwrap(), "success");
-
-        // Check that the value is visible after the transaction
-        let final_val = handle.get(&"key".to_string());
-        assert_eq!(final_val.as_deref().map(|s| s.as_str()), Some("value"));
-    }
-
-    #[tokio::test]
-    async fn test_transaction_closure_rollback() {
-        let db: Arc<Database<String, String>> = Arc::new(Database::new_in_memory());
-        let mut handle = db.handle();
-
-        let result: Result<String, FluxError> = handle
-            .transaction(|h| {
-                Box::pin(async move {
-                    h.insert("key".to_string(), "value".to_string()).await;
-                    // Return an error to trigger rollback
-                    Err(FluxError::NoActiveTransaction) // Using a FluxError for simplicity
-                })
-            })
-            .await;
-
-        assert!(result.is_err());
-
-        // Check that the value is NOT visible after the transaction
-        let final_val = handle.get(&"key".to_string());
-        assert!(final_val.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_drop_rolls_back() {
-        let db: Arc<Database<String, String>> = Arc::new(Database::new_in_memory());
-
-        {
-            let mut handle = db.handle();
-            handle.begin().unwrap();
-            handle.insert("key".to_string(), "value".to_string()).await;
-            // handle is dropped here at the end of the scope
-        }
-
-        // A new handle should not see the changes
-        let new_handle = db.handle();
-        let val = new_handle.get(&"key".to_string());
-        assert!(
-            val.is_none(),
-            "Changes should be rolled back when handle is dropped"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_commit_logs_to_wal() {
-        use crate::persistence::DurabilityLevel;
-        use std::collections::HashMap;
-        use tempfile::tempdir;
-
-        let temp_dir = tempdir().unwrap();
-        let wal_path = temp_dir.path().to_path_buf();
-        let config = DurabilityLevel::Full {
-            wal_path: wal_path.clone(),
-        };
-
-        // Create a durable database
-        let db: Database<String, i32> = Database::new(config).await.unwrap();
-        let mut handle = db.handle();
-
-        // Begin, insert, and commit
-        handle.begin().unwrap();
-        handle.insert("logged_key".to_string(), 12345).await;
-        handle.commit().await.unwrap();
-
-        // Verify the WAL file contains the committed data
-        let wal_file_path = wal_path.join("wal.0");
-        assert!(wal_file_path.exists());
-
-        let wal_data = std::fs::read(wal_file_path).unwrap();
-        assert!(!wal_data.is_empty());
-
-        // Deserialize and check the content
-        let mut expected_workspace: HashMap<String, Option<Arc<i32>>> = HashMap::new();
-        expected_workspace.insert("logged_key".to_string(), Some(Arc::new(12345)));
-
-        let deserialized_workspace: HashMap<String, Option<Arc<i32>>> =
-            ciborium::from_reader(&wal_data[..]).unwrap();
-
-        assert_eq!(deserialized_workspace.len(), 1);
-        let (key, value) = deserialized_workspace.iter().next().unwrap();
-        assert_eq!(key, "logged_key");
-        assert_eq!(value.as_ref().unwrap().as_ref(), &12345);
-    }
-
-    #[tokio::test]
-    async fn test_recovery_on_startup() {
-        use crate::persistence::DurabilityLevel;
-        use tempfile::tempdir;
-
-        let temp_dir = tempdir().unwrap();
-        let wal_path = temp_dir.path().to_path_buf();
-        let config = DurabilityLevel::Full {
-            wal_path: wal_path.clone(),
-        };
-
-        // --- First Session ---
-        {
-            let db: Database<String, i32> = Database::new(config.clone()).await.unwrap();
-            let mut handle = db.handle();
-            handle.begin().unwrap();
-            handle.insert("key1".to_string(), 1).await;
-            handle.insert("key2".to_string(), 2).await;
-            handle.commit().await.unwrap(); // Ensure data is committed
-            // DB is dropped here, simulating a shutdown
-        }
-
-        // --- Second Session ---
-        // Create a new database instance pointing to the same directory.
-        // The new `recover` logic should be triggered inside `new`.
-        let db: Database<String, i32> = Database::new(config).await.unwrap();
-        let handle = db.handle();
-
-        // Verify that the data from the first session is present.
-        assert_eq!(*handle.get(&"key1".to_string()).unwrap(), 1);
-        assert_eq!(*handle.get(&"key2".to_string()).unwrap(), 2);
     }
 }

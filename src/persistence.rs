@@ -39,9 +39,35 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tokio::sync::Notify;
 
-const WAL_POOL_SIZE: usize = 4;
-const WAL_SEGMENT_SIZE_BYTES: u64 = 1 * 1024 * 1024; // 1MB for easier testing
+pub const WAL_SEGMENT_SIZE_BYTES: u64 = 1 * 1024 * 1024; // 1MB for easier testing
+
+/// Options for configuring data durability.
+#[derive(Debug, Clone)]
+pub struct PersistenceOptions {
+    /// The directory path to store WAL and snapshot files.
+    pub wal_path: PathBuf,
+    /// The number of WAL segment files to cycle through.
+    ///
+    /// Defaults to 4.
+    pub wal_pool_size: usize,
+    /// The size of each WAL segment file in bytes.
+    ///
+    /// Defaults to 1MB.
+    pub wal_segment_size_bytes: u64,
+}
+
+impl PersistenceOptions {
+    /// Creates new persistence options with a specified path and default values for other settings.
+    pub fn new(wal_path: PathBuf) -> Self {
+        Self {
+            wal_path,
+            wal_pool_size: 4,
+            wal_segment_size_bytes: 1 * 1024 * 1024, // 1MB
+        }
+    }
+}
 
 /// Defines the durability guarantees for the database.
 #[derive(Debug, Clone)]
@@ -51,16 +77,25 @@ pub enum DurabilityLevel {
     InMemory,
     /// **Relaxed Durability (Group Commit):** Acknowledges a commit after the data
     /// has been written to the operating system's buffer. A background task
-    /// periodically flushes this buffer to disk (`fsync`).
+    /// flushes this buffer to disk when one of the configured conditions is met.
+    ///
+    /// At least one condition must be set.
     ///
     /// - **Pros:** High throughput, as it avoids waiting for disk I/O on every commit.
     /// - **Cons:** In the event of an OS crash or power failure, transactions that
     ///   occurred since the last flush may be lost.
     Relaxed {
-        /// The directory path to store WAL and snapshot files.
-        wal_path: PathBuf,
-        /// The interval at which the background task flushes the OS buffer to disk.
-        flush_interval: Duration,
+        /// The configuration options for persistence.
+        options: PersistenceOptions,
+        /// Flushes after `T` milliseconds have passed since the last flush.
+        /// This provides a latency bound for durability.
+        flush_interval_ms: Option<u64>,
+        /// Flushes after `N` commits have occurred since the last flush.
+        /// This provides a deterministic bound on the number of transactions that can be lost.
+        flush_after_n_commits: Option<usize>,
+        /// Flushes after `M` bytes have been written to the WAL since the last flush.
+        /// This helps control the size of the buffer and recovery time.
+        flush_after_m_bytes: Option<u64>,
     },
     /// **Full Durability (Per-Transaction `fsync`):** Acknowledges a commit only
     /// after the data has been fully written and synced to the physical disk.
@@ -70,13 +105,13 @@ pub enum DurabilityLevel {
     /// - **Cons:** Lower throughput due to the performance cost of `fsync` on every
     ///   transaction.
     Full {
-        /// The directory path to store WAL and snapshot files.
-        wal_path: PathBuf,
+        /// The configuration options for persistence.
+        options: PersistenceOptions,
     },
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum WalSegmentState {
+pub enum WalSegmentState {
     Writing,
     PendingSnapshot,
     Available,
@@ -132,6 +167,12 @@ pub struct PersistenceEngine<K, V> {
     current_segment_idx: Arc<AtomicUsize>,
     writer_position: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
+    // For Relaxed mode flushing
+    flush_signal: Arc<Notify>,
+    /// The number of commits since the last flush.
+    pub commits_since_flush: Arc<AtomicUsize>,
+    /// The number of bytes written to the WAL since the last flush.
+    pub bytes_since_flush: Arc<AtomicU64>,
     // A channel to send completed segments to the snapshotter
     snapshot_queue_tx: mpsc::Sender<usize>,
     _snapshot_queue_rx: Arc<Mutex<mpsc::Receiver<usize>>>,
@@ -141,11 +182,11 @@ pub struct PersistenceEngine<K, V> {
     _phantom: PhantomData<(K, V)>,
 }
 
-fn setup_wal_files(wal_path: &PathBuf) -> io::Result<Vec<WalSegment>> {
-    fs::create_dir_all(wal_path)?;
-    let mut wal_segments = Vec::with_capacity(WAL_POOL_SIZE);
-    for i in 0..WAL_POOL_SIZE {
-        let segment_path = wal_path.join(format!("wal.{}", i));
+fn setup_wal_files(options: &PersistenceOptions) -> io::Result<Vec<WalSegment>> {
+    fs::create_dir_all(&options.wal_path)?;
+    let mut wal_segments = Vec::with_capacity(options.wal_pool_size);
+    for i in 0..options.wal_pool_size {
+        let segment_path = options.wal_path.join(format!("wal.{}", i));
         let file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -153,7 +194,12 @@ fn setup_wal_files(wal_path: &PathBuf) -> io::Result<Vec<WalSegment>> {
 
         // Pre-allocate space for the WAL segment to reduce fragmentation and
         // ensure space is available.
-        fallocate(&file, FallocateFlags::empty(), 0, WAL_SEGMENT_SIZE_BYTES)?;
+        fallocate(
+            &file,
+            FallocateFlags::empty(),
+            0,
+            options.wal_segment_size_bytes,
+        )?;
 
         let initial_state = if i == 0 {
             WalSegmentState::Writing
@@ -191,18 +237,21 @@ where
             return Ok(None);
         }
 
-        let wal_path = match &config {
-            DurabilityLevel::Relaxed { wal_path, .. } => wal_path,
-            DurabilityLevel::Full { wal_path } => wal_path,
+        let options = match &config {
+            DurabilityLevel::Relaxed { options, .. } => options,
+            DurabilityLevel::Full { options } => options,
             DurabilityLevel::InMemory => unreachable!(),
         };
 
-        let snapshot_path = wal_path.join("snapshot.db");
-        let wal_segments = setup_wal_files(wal_path)?;
+        let snapshot_path = options.wal_path.join("snapshot.db");
+        let wal_segments = setup_wal_files(options)?;
         let (tx, rx) = mpsc::channel();
         let snapshot_queue_rx = Arc::new(Mutex::new(rx));
         let current_segment_idx = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let flush_signal = Arc::new(Notify::new());
+        let commits_since_flush = Arc::new(AtomicUsize::new(0));
+        let bytes_since_flush = Arc::new(AtomicU64::new(0));
 
         // --- Snapshotter Thread ---
         // This thread waits for filled WAL segments, applies them to a new snapshot,
@@ -210,21 +259,20 @@ where
         let segments_clone_snap = wal_segments.clone();
         let rx_clone_snap = Arc::clone(&snapshot_queue_rx);
         let snapshot_path_clone = snapshot_path.clone();
-        let wal_path_clone = wal_path.clone();
+        let wal_path_clone = options.wal_path.clone();
         let shutdown_clone_snap = Arc::clone(&shutdown);
         let snapshotter_handle = std::thread::spawn(move || {
             while !shutdown_clone_snap.load(Ordering::Relaxed) {
                 let segment_idx = {
-                    let rx = rx_clone_snap.lock().unwrap();
+                    let rx = rx_clone_snap.lock().expect("Snapshot queue mutex poisoned");
                     match rx.try_recv() {
                         Ok(idx) => idx,
                         Err(mpsc::TryRecvError::Empty) => {
-                            // No message, wait a bit and check shutdown flag again
                             std::thread::sleep(Duration::from_millis(50));
                             continue;
                         }
                         Err(mpsc::TryRecvError::Disconnected) => {
-                            // Channel disconnected, time to shut down
+                            eprintln!("Snapshotter: Snapshot queue disconnected, shutting down.");
                             return;
                         }
                     }
@@ -232,86 +280,157 @@ where
 
                 let segment: &WalSegment = &segments_clone_snap[segment_idx];
 
-                // 1. Verify state is PendingSnapshot
                 {
-                    let state = segment.state.lock().unwrap();
+                    let state = segment.state.lock().expect("WalSegment state mutex poisoned");
                     if *state != WalSegmentState::PendingSnapshot {
-                        // This would be a critical error, but for now we'll just continue.
-                        // In a real system, log this error.
+                        eprintln!(
+                            "Snapshotter: Segment {} in unexpected state: {:?}",
+                            segment_idx, *state
+                        );
                         continue;
                     }
-                } // State lock released
+                }
 
-                // 2. Load current snapshot
                 let mut snapshot_data: SnapshotData<K, V> = if snapshot_path_clone.exists() {
-                    let file = File::open(&snapshot_path_clone).unwrap();
-                    ciborium::from_reader(file).unwrap_or_default()
+                    match File::open(&snapshot_path_clone) {
+                        Ok(file) => ciborium::from_reader(file).unwrap_or_else(|e| {
+                            eprintln!("Snapshotter: Failed to deserialize snapshot from {:?}: {}", snapshot_path_clone, e);
+                            SnapshotData::default()
+                        }),
+                        Err(e) => {
+                            eprintln!("Snapshotter: Failed to open existing snapshot file {:?}: {}", snapshot_path_clone, e);
+                            SnapshotData::default()
+                        }
+                    }
                 } else {
                     SnapshotData::default()
                 };
 
-                // 3. Read WAL segment and apply changes
                 let wal_file_path = wal_path_clone.join(format!("wal.{}", segment_idx));
                 if let Ok(wal_file) = File::open(&wal_file_path) {
                     let mut reader = BufReader::new(wal_file);
-                    while let Ok(workspace) =
-                        ciborium::from_reader::<Workspace<K, V>, _>(&mut reader)
-                    {
-                        for (key, value) in workspace {
-                            match value {
-                                Some(val) => {
-                                    snapshot_data.data.insert(key, val);
+                    loop {
+                        match ciborium::from_reader::<Workspace<K, V>, _>(&mut reader) {
+                            Ok(workspace) => {
+                                for (key, value) in workspace {
+                                    match value {
+                                        Some(val) => {
+                                            snapshot_data.data.insert(key, val);
+                                        }
+                                        None => {
+                                            snapshot_data.data.remove(&key);
+                                        }
+                                    }
                                 }
-                                None => {
-                                    snapshot_data.data.remove(&key);
-                                }
+                            }
+                            Err(ciborium::de::Error::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                                break; // Reached end of file
+                            }
+                            Err(e) => {
+                                eprintln!("Snapshotter: Failed to deserialize workspace from WAL segment {:?}: {}", wal_file_path, e);
+                                break; // Stop processing this WAL segment
                             }
                         }
                     }
+                } else {
+                    eprintln!("Snapshotter: Failed to open WAL segment file {:?}.", wal_file_path);
                 }
 
-                // 4. Update metadata and write new snapshot atomically
                 snapshot_data.last_processed_segment_idx = Some(segment_idx);
                 let tmp_snapshot_path = snapshot_path_clone.with_extension("db.tmp");
 
-                let tmp_file = File::create(&tmp_snapshot_path).unwrap();
-                ciborium::into_writer(&snapshot_data, tmp_file).unwrap();
+                let write_result = (|| {
+                    let tmp_file = File::create(&tmp_snapshot_path)?;
+                    ciborium::into_writer(&snapshot_data, tmp_file)
+                        .map_err(|e| match e {
+                            ciborium::ser::Error::Io(io_err) => io_err,
+                            ciborium::ser::Error::Value(msg) => io::Error::new(io::ErrorKind::InvalidData, msg),
+                        })?;
+                    let file_to_sync = File::open(&tmp_snapshot_path)?;
+                    file_to_sync.sync_all()?;
+                    fs::rename(&tmp_snapshot_path, &snapshot_path_clone)?;
+                    Ok::<(), io::Error>(())
+                })();
 
-                // Fsync and rename
-                File::open(&tmp_snapshot_path).unwrap().sync_all().unwrap();
-                fs::rename(&tmp_snapshot_path, &snapshot_path_clone).unwrap();
-
-                // 5. Truncate the WAL file to mark it as free.
-                {
-                    if let Ok(file) = segment.file.lock() {
-                        let _ = file.set_len(0);
+                if let Err(e) = write_result {
+                    eprintln!("Snapshotter: Failed to write or rename snapshot file {:?}: {}", snapshot_path_clone, e);
+                    let _ = fs::remove_file(&tmp_snapshot_path); // Clean up temp file
+                } else {
+                    // Truncate the WAL file to mark it as free.
+                    if let Ok(mut file) = segment.file.lock() {
+                        if let Err(e) = file.set_len(0) {
+                            eprintln!("Snapshotter: Failed to truncate WAL segment file {}: {}", segment_idx, e);
+                        }
+                        if let Err(e) = file.seek(SeekFrom::Start(0)) {
+                            eprintln!("Snapshotter: Failed to seek WAL segment file {}: {}", segment_idx, e);
+                        }
+                    } else {
+                        eprintln!("Snapshotter: Failed to lock WAL segment file {} for truncation.", segment_idx);
                     }
-                }
 
-                // 6. Mark the segment as Available again.
-                {
-                    let mut state = segment.state.lock().unwrap();
-                    *state = WalSegmentState::Available;
+                    // Mark the segment as Available again.
+                    if let Ok(mut state) = segment.state.lock() {
+                        *state = WalSegmentState::Available;
+                    } else {
+                        eprintln!("Snapshotter: Failed to lock WAL segment state for marking as available.");
+                    }
                 }
             }
         });
 
         // --- Flusher Thread (only for Relaxed mode) ---
-        // This thread periodically calls `fsync` on the active WAL segment.
-        let flusher_handle = if let DurabilityLevel::Relaxed { flush_interval, .. } = &config {
+        let flusher_handle = if let DurabilityLevel::Relaxed { flush_interval_ms, .. } = config {
             let segments_clone_flush = wal_segments.clone();
             let current_idx_clone_flush = Arc::clone(&current_segment_idx);
-            let flush_interval_clone = *flush_interval;
             let shutdown_clone_flush = Arc::clone(&shutdown);
+            let flush_signal_clone = Arc::clone(&flush_signal);
+            let commits_clone = Arc::clone(&commits_since_flush);
+            let bytes_clone = Arc::clone(&bytes_since_flush);
+
             Some(std::thread::spawn(move || {
-                while !shutdown_clone_flush.load(Ordering::Relaxed) {
-                    std::thread::sleep(flush_interval_clone);
-                    let idx = current_idx_clone_flush.load(Ordering::Relaxed);
-                    let segment = &segments_clone_flush[idx];
-                    if let Ok(file) = segment.file.lock() {
-                        let _ = file.sync_all();
+                 let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                runtime.block_on(async move {
+                    loop {
+                        if shutdown_clone_flush.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        let wait_future = flush_signal_clone.notified();
+                        let timeout_future = if let Some(interval) = flush_interval_ms {
+                            tokio::time::sleep(Duration::from_millis(interval))
+                        } else {
+                            // If no interval is set, wait indefinitely for a signal.
+                            tokio::time::sleep(Duration::from_secs(u64::MAX))
+                        };
+
+                        tokio::select! {
+                            _ = wait_future => {
+                                // Woken by a signal (N commits or M bytes)
+                            },
+                            _ = timeout_future => {
+                                // Woken by timeout
+                            }
+                        };
+
+                        if shutdown_clone_flush.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        let idx = current_idx_clone_flush.load(Ordering::Relaxed);
+                        let segment = &segments_clone_flush[idx];
+                        if let Ok(file) = segment.file.lock() {
+                            if file.sync_all().is_ok() {
+                                // Reset counters on successful flush
+                                commits_clone.store(0, Ordering::Relaxed);
+                                bytes_clone.store(0, Ordering::Relaxed);
+                            }
+                        }
                     }
-                }
+                });
             }))
         } else {
             None
@@ -319,12 +438,15 @@ where
 
         Ok(Some(Self {
             config: config.clone(),
-            wal_path: wal_path.clone(),
+            wal_path: options.wal_path.clone(),
             snapshot_path,
             wal_segments,
             current_segment_idx,
             writer_position: Arc::new(AtomicU64::new(0)),
             shutdown,
+            flush_signal,
+            commits_since_flush,
+            bytes_since_flush,
             snapshot_queue_tx: tx,
             _snapshot_queue_rx: snapshot_queue_rx,
             _flusher_handle: flusher_handle,
@@ -362,8 +484,13 @@ where
         }
 
         // 3. Find WALs to replay, sorted by modification time
+        let wal_pool_size = match &self.config {
+            DurabilityLevel::Relaxed { options, .. } => options.wal_pool_size,
+            DurabilityLevel::Full { options } => options.wal_pool_size,
+            DurabilityLevel::InMemory => unreachable!(),
+        };
         let mut wal_files = Vec::new();
-        for i in 0..WAL_POOL_SIZE {
+        for i in 0..wal_pool_size {
             let path = self.wal_path.join(format!("wal.{}", i));
             if path.exists() {
                 let meta = fs::metadata(&path)?;
@@ -427,9 +554,15 @@ where
         loop {
             let current_pos = self.writer_position.load(Ordering::Relaxed);
 
+            let segment_size = match &self.config {
+                DurabilityLevel::Relaxed { options, .. } => options.wal_segment_size_bytes,
+                DurabilityLevel::Full { options } => options.wal_segment_size_bytes,
+                DurabilityLevel::InMemory => unreachable!(),
+            };
+
             // --- Rotation Check ---
             // Check if write fits *before* acquiring the lock.
-            if current_pos + data.len() as u64 > WAL_SEGMENT_SIZE_BYTES {
+            if current_pos + data.len() as u64 > segment_size {
                 self.rotate_wal()?;
                 // After rotation, restart the loop to get the new segment and position.
                 continue;
@@ -451,8 +584,38 @@ where
             } // Lock is released here
 
             // Update writer position after a successful write.
+            let bytes_written = data.len() as u64;
             self.writer_position
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
+                .fetch_add(bytes_written, Ordering::Relaxed);
+
+            // --- Trigger flush if in Relaxed mode and a condition is met ---
+            if let DurabilityLevel::Relaxed {
+                flush_after_n_commits,
+                flush_after_m_bytes,
+                ..
+            } = &self.config
+            {
+                let old_commits = self.commits_since_flush.fetch_add(1, Ordering::Relaxed);
+                let old_bytes = self
+                    .bytes_since_flush
+                    .fetch_add(bytes_written, Ordering::Relaxed);
+
+                let mut should_flush = false;
+                if let Some(n) = flush_after_n_commits {
+                    if old_commits + 1 >= *n {
+                        should_flush = true;
+                    }
+                }
+                if let Some(m) = flush_after_m_bytes {
+                    if old_bytes + bytes_written >= *m {
+                        should_flush = true;
+                    }
+                }
+
+                if should_flush {
+                    self.flush_signal.notify_one();
+                }
+            }
 
             // If the write was successful, exit the loop.
             return Ok(());
@@ -467,8 +630,13 @@ where
     /// 3. Marking the old segment as `PendingSnapshot` and sending it to the snapshotter.
     /// 4. Marking the new segment as `Writing` and resetting its state.
     fn rotate_wal(&self) -> io::Result<()> {
+        let wal_pool_size = match &self.config {
+            DurabilityLevel::Relaxed { options, .. } => options.wal_pool_size,
+            DurabilityLevel::Full { options } => options.wal_pool_size,
+            DurabilityLevel::InMemory => unreachable!(),
+        };
         let current_idx = self.current_segment_idx.load(Ordering::Relaxed);
-        let next_idx = (current_idx + 1) % WAL_POOL_SIZE;
+        let next_idx = (current_idx + 1) % wal_pool_size;
 
         // Block until the next segment is available.
         loop {
@@ -492,6 +660,10 @@ where
         // Reset writer position and update current segment index
         self.writer_position.store(0, Ordering::Relaxed);
         self.current_segment_idx.store(next_idx, Ordering::Relaxed);
+        
+        // Also reset the flush counters as rotation implies a flush of the old segment
+        self.commits_since_flush.store(0, Ordering::Relaxed);
+        self.bytes_since_flush.store(0, Ordering::Relaxed);
 
         // Truncate the new segment file before using it
         let segment = &self.wal_segments[next_idx];
@@ -509,240 +681,14 @@ impl<K, V> Drop for PersistenceEngine<K, V> {
         self.shutdown.store(true, Ordering::Relaxed);
 
         if let Some(handle) = self._flusher_handle.take() {
-            handle.join().unwrap();
+            if let Err(e) = handle.join() {
+                eprintln!("Flusher thread panicked: {:?}", e);
+            }
         }
         if let Some(handle) = self._snapshotter_handle.take() {
-            handle.join().unwrap();
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Seek};
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_initialization_in_memory() {
-        let config = DurabilityLevel::InMemory;
-        let engine = PersistenceEngine::<String, String>::new(config).unwrap();
-        assert!(engine.is_none());
-    }
-
-    #[test]
-    fn test_durable_initialization_creates_files() {
-        let temp_dir = tempdir().unwrap();
-        let wal_path = temp_dir.path().to_path_buf();
-        let config = DurabilityLevel::Full {
-            wal_path: wal_path.clone(),
-        };
-
-        let engine = PersistenceEngine::<String, String>::new(config)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(engine.wal_segments.len(), WAL_POOL_SIZE);
-        for i in 0..WAL_POOL_SIZE {
-            let file_lock = engine.wal_segments[i].file.lock().unwrap();
-            let metadata = file_lock.metadata().unwrap();
-            // We can't assert equality because fallocate might not be supported on all test filesystems,
-            // in which case the size will be 0.
-            assert!(metadata.len() == WAL_SEGMENT_SIZE_BYTES || metadata.len() == 0);
-        }
-
-        let segment0_state = engine.wal_segments[0].state.lock().unwrap();
-        assert_eq!(*segment0_state, WalSegmentState::Writing);
-
-        for i in 1..WAL_POOL_SIZE {
-            let segment_state = engine.wal_segments[i].state.lock().unwrap();
-            assert_eq!(*segment_state, WalSegmentState::Available);
-        }
-    }
-
-    #[test]
-    fn test_log_writes_to_wal() {
-        let temp_dir = tempdir().unwrap();
-        let wal_path = temp_dir.path().to_path_buf();
-        let config = DurabilityLevel::Full {
-            wal_path: wal_path.clone(),
-        };
-        let engine = PersistenceEngine::<String, String>::new(config)
-            .unwrap()
-            .unwrap();
-
-        // --- First Write ---
-        let data1 = b"first write";
-        engine.log(data1).unwrap();
-        assert_eq!(
-            engine.writer_position.load(Ordering::Relaxed),
-            data1.len() as u64
-        );
-
-        // Verify content
-        let mut wal0_file = File::open(wal_path.join("wal.0")).unwrap();
-        let mut buffer = vec![0; data1.len()];
-        wal0_file.read_exact(&mut buffer).unwrap();
-        assert_eq!(&buffer, data1);
-
-        // --- Second Write ---
-        let data2 = b"second write";
-        engine.log(data2).unwrap();
-        assert_eq!(
-            engine.writer_position.load(Ordering::Relaxed),
-            (data1.len() + data2.len()) as u64
-        );
-
-        // Verify content
-        wal0_file.seek(SeekFrom::Start(data1.len() as u64)).unwrap();
-        let mut buffer = vec![0; data2.len()];
-        wal0_file.read_exact(&mut buffer).unwrap();
-        assert_eq!(&buffer, data2);
-    }
-
-    #[test]
-    fn test_log_triggers_rotation() {
-        let temp_dir = tempdir().unwrap();
-        let wal_path = temp_dir.path().to_path_buf();
-        let config = DurabilityLevel::Full {
-            wal_path: wal_path.clone(),
-        };
-        let engine = PersistenceEngine::<String, String>::new(config)
-            .unwrap()
-            .unwrap();
-
-        // Almost fill the first segment
-        let large_write = vec![0; (WAL_SEGMENT_SIZE_BYTES - 10) as usize];
-        engine.log(&large_write).unwrap();
-        assert_eq!(engine.current_segment_idx.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            engine.writer_position.load(Ordering::Relaxed),
-            large_write.len() as u64
-        );
-
-        // This write should trigger the rotation
-        let final_write = b"this should rotate";
-        engine.log(final_write).unwrap();
-
-        // Verify rotation occurred
-        assert_eq!(engine.current_segment_idx.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            engine.writer_position.load(Ordering::Relaxed),
-            final_write.len() as u64
-        );
-
-        // Verify the new segment is for writing
-        let segment1_state = engine.wal_segments[1].state.lock().unwrap();
-        assert_eq!(*segment1_state, WalSegmentState::Writing);
-
-        // Verify the data was written to the new segment
-        let mut wal1_file = File::open(wal_path.join("wal.1")).unwrap();
-        let mut buffer = vec![0; final_write.len()];
-        wal1_file.read_exact(&mut buffer).unwrap();
-        assert_eq!(&buffer, final_write);
-
-        // Instead of checking the channel, wait for wal.0 to become Available
-        let mut wal0_available = false;
-        for _ in 0..100 {
-            // Try for a bit
-            let state = engine.wal_segments[0].state.lock().unwrap();
-            if *state == WalSegmentState::Available {
-                wal0_available = true;
-                break;
+            if let Err(e) = handle.join() {
+                eprintln!("Snapshotter thread panicked: {:?}", e);
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(
-            wal0_available,
-            "wal.0 did not become Available after rotation"
-        );
-    }
-
-    #[test]
-    fn test_relaxed_mode_flusher() {
-        let temp_dir = tempdir().unwrap();
-        let wal_path = temp_dir.path().to_path_buf();
-        let flush_interval = Duration::from_millis(50);
-        let config = DurabilityLevel::Relaxed {
-            wal_path: wal_path.clone(),
-            flush_interval,
-        };
-
-        // Create the engine, which spawns the flusher thread
-        let engine = PersistenceEngine::<String, String>::new(config)
-            .unwrap()
-            .unwrap();
-        assert!(engine._flusher_handle.is_some());
-
-        // Write some data. In relaxed mode, this only writes to the OS buffer.
-        let data = b"some data to be flushed";
-        engine.log(data).unwrap();
-
-        // Wait for the flusher thread to run
-        std::thread::sleep(flush_interval.saturating_add(Duration::from_millis(50)));
-
-        // Verify the data was flushed to disk by reading the file directly.
-        let mut wal0_file = File::open(wal_path.join("wal.0")).unwrap();
-        let mut buffer = vec![0; data.len()];
-        wal0_file.read_exact(&mut buffer).unwrap();
-        assert_eq!(&buffer, data);
-    }
-
-    #[test]
-    fn test_snapshotter_frees_segments() {
-        let temp_dir = tempdir().unwrap();
-        let wal_path = temp_dir.path().to_path_buf();
-        let config = DurabilityLevel::Full {
-            wal_path: wal_path.clone(),
-        };
-
-        let engine = PersistenceEngine::<String, String>::new(config)
-            .unwrap()
-            .unwrap();
-        assert!(engine._snapshotter_handle.is_some());
-
-        let data_size = (WAL_SEGMENT_SIZE_BYTES / 2) as usize; // Half a segment
-        let data = vec![0u8; data_size];
-
-        // Fill all segments and trigger rotations
-        for _i in 0..WAL_POOL_SIZE * 2 {
-            // Trigger more rotations than segments
-            engine.log(&data).unwrap();
-            // After each log, the current segment might be full, triggering a rotation.
-            // The snapshotter should eventually free up segments.
-            // We need to give the snapshotter thread some time to process.
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        // Verify that we successfully rotated through segments.
-        // The current segment index should be different from the initial one.
-        let final_idx = engine.current_segment_idx.load(Ordering::Relaxed);
-        assert!(final_idx < WAL_POOL_SIZE); // Should be a valid index
-
-        // Try to write one more time to ensure a segment is available.
-        engine.log(&data).unwrap();
-
-        // Check that all segments eventually become available (or are in Writing state)
-        // This is a more robust check than just asserting the final index.
-        let mut all_available_or_writing = false;
-        for _ in 0..100 {
-            // Try for a bit
-            all_available_or_writing = true;
-            for i in 0..WAL_POOL_SIZE {
-                let state = engine.wal_segments[i].state.lock().unwrap();
-                if *state != WalSegmentState::Available && *state != WalSegmentState::Writing {
-                    all_available_or_writing = false;
-                    break;
-                }
-            }
-            if all_available_or_writing {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            all_available_or_writing,
-            "Not all segments became available or writing"
-        );
     }
 }

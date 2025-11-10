@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 // --- Core MVCC Types ---
 
@@ -362,7 +362,7 @@ pub struct Transaction<K: Eq + std::hash::Hash, V> {
     pub in_conflict: AtomicBool,
     /// The transaction's private workspace for pending changes (inserts, updates, deletes).
     /// These changes are only applied to the main database upon a successful commit.
-    pub workspace: Mutex<Workspace<K, V>>, // Changed for thread-safety
+    pub workspace: RwLock<Workspace<K, V>>,
     _phantom: std::marker::PhantomData<V>,
 }
 
@@ -379,7 +379,7 @@ where
             read_set: DashMap::new(),
             write_set: DashSet::new(),
             in_conflict: AtomicBool::new(false),
-            workspace: Mutex::new(HashMap::new()), // Initialize workspace
+            workspace: RwLock::new(HashMap::new()), // Initialize workspace
             _phantom: std::marker::PhantomData,
         }
     }

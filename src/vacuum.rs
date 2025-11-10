@@ -107,7 +107,7 @@ where
                                 next_version_ptr,
                                 Ordering::AcqRel,
                                 Ordering::Acquire,
-                                guard, // Re-added the missing guard argument
+                                guard,
                             )
                             .is_ok()
                         {
