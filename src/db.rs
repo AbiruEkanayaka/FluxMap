@@ -58,15 +58,19 @@
 //! # }
 //! ```
 
-use crate::error::FluxError;
+use crate::error::{FluxError, PersistenceError};
+use crate::mem::MemSize;
 use crate::persistence::{DurabilityLevel, PersistenceEngine, PersistenceOptions};
 use crate::transaction::Transaction;
 use crate::SkipList;
+use futures::stream::StreamExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::borrow::Borrow;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -113,6 +117,7 @@ pub struct DatabaseBuilder<K, V> {
     flush_interval: Option<Duration>,
     flush_after_n_commits: Option<usize>,
     flush_after_m_bytes: Option<u64>,
+    max_memory_bytes: Option<u64>,
     _phantom: PhantomData<(K, V)>,
 }
 
@@ -125,6 +130,7 @@ impl<K, V> Default for DatabaseBuilder<K, V> {
             flush_interval: None,
             flush_after_n_commits: None,
             flush_after_m_bytes: None,
+            max_memory_bytes: None,
             _phantom: PhantomData,
         }
     }
@@ -141,8 +147,8 @@ where
         + Eq
         + Serialize
         + for<'de> Deserialize<'de>
-        + std::borrow::Borrow<str>,
-    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de>,
+        + MemSize,
+    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
 {
     /// Configures the database for full durability (`fsync` per transaction).
     pub fn durability_full(mut self, options: PersistenceOptions) -> Self {
@@ -187,6 +193,15 @@ where
         self
     }
 
+    /// Sets a memory limit for the database.
+    ///
+    /// When the estimated memory usage exceeds this limit, the database will
+    /// begin evicting the least recently used (LRU) keys to stay under the limit.
+    pub fn max_memory(mut self, bytes: u64) -> Self {
+        self.max_memory_bytes = Some(bytes);
+        self
+    }
+
     /// Builds the `Database` instance with the specified configurations.
     pub async fn build(self) -> Result<Database<K, V>, FluxError> {
         let durability = match self.persistence_options {
@@ -195,8 +210,11 @@ where
                     DurabilityLevel::Full { options }
                 } else {
                     let flush_interval_ms = self.flush_interval.map(|d| d.as_millis() as u64);
-                    if flush_interval_ms.is_none() && self.flush_after_n_commits.is_none() && self.flush_after_m_bytes.is_none() {
-                        return Err(FluxError::PersistenceError("Relaxed durability mode requires at least one flush condition (interval, commits, or bytes).".to_string()));
+                    if flush_interval_ms.is_none()
+                        && self.flush_after_n_commits.is_none()
+                        && self.flush_after_m_bytes.is_none()
+                    {
+                        return Err(FluxError::Configuration("Relaxed durability mode requires at least one flush condition (interval, commits, or bytes).".to_string()));
                     }
                     DurabilityLevel::Relaxed {
                         options,
@@ -209,19 +227,23 @@ where
             None => DurabilityLevel::InMemory,
         };
 
-        let persistence_engine = PersistenceEngine::new(durability)
-            .map_err(|e| FluxError::PersistenceError(e.to_string()))?
+        let persistence_engine = PersistenceEngine::new(durability)?
             .map(Arc::new);
+
+        let current_memory_bytes = Arc::new(AtomicU64::new(0));
+        let access_clock = Arc::new(AtomicU64::new(0));
 
         let skiplist = if let Some(engine) = &persistence_engine {
             Arc::new(
                 engine
-                    .recover()
-                    .await
-                    .map_err(|e| FluxError::PersistenceError(e.to_string()))?,
+                    .recover(current_memory_bytes.clone(), access_clock.clone())
+                    .await?,
             )
         } else {
-            Arc::new(SkipList::new())
+            Arc::new(SkipList::new(
+                current_memory_bytes.clone(),
+                access_clock.clone(),
+            ))
         };
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -256,6 +278,8 @@ where
             persistence_engine,
             _vacuum_handle: vacuum_handle,
             shutdown,
+            max_memory_bytes: self.max_memory_bytes,
+            current_memory_bytes,
         })
     }
 }
@@ -269,19 +293,41 @@ where
 /// Use the [`Database::builder()`] method to construct a new database.
 pub struct Database<K, V>
 where
-    K: Ord + Clone + Send + Sync + 'static + std::hash::Hash + Eq + Serialize + DeserializeOwned,
-    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned,
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + std::hash::Hash
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + MemSize,
+    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
     skiplist: Arc<SkipList<K, V>>,
     persistence_engine: Option<Arc<PersistenceEngine<K, V>>>,
     _vacuum_handle: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    /// The configured memory limit in bytes.
+    max_memory_bytes: Option<u64>,
+    /// An atomic counter for the estimated current memory usage.
+    current_memory_bytes: Arc<AtomicU64>,
 }
 
 impl<K, V> Drop for Database<K, V>
 where
-    K: Ord + Clone + Send + Sync + 'static + std::hash::Hash + Eq + Serialize + DeserializeOwned,
-    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned,
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + std::hash::Hash
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + MemSize,
+    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -304,8 +350,52 @@ where
         + Eq
         + Serialize
         + for<'de> Deserialize<'de>
-        + std::borrow::Borrow<str>,
-    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de>,
+        + MemSize,
+    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
+{
+    /// Checks if memory usage exceeds the configured limit and evicts keys until it's under the limit.
+    async fn evict_if_needed(&self) {
+        if let Some(max_mem) = self.max_memory_bytes {
+            while self.current_memory_bytes.load(Ordering::Relaxed) > max_mem {
+                if self.evict_one().await.is_err() {
+                    // Could not find a victim or eviction failed, stop trying for now.
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Finds and evicts a single LRU victim.
+    async fn evict_one(&self) -> Result<(), FluxError> {
+        if let Some(victim_key) = self.skiplist.find_lru_victim_key() {
+            // The eviction in the skiplist is synchronous and updates the counter.
+            // We don't need to do anything with a transaction here, as the eviction
+            // is a low-level administrative task that marks the node as dead.
+            if self.skiplist.evict(&victim_key).is_some() {
+                Ok(())
+            } else {
+                Err(FluxError::EvictionError)
+            }
+        } else {
+            Err(FluxError::EvictionError) // No victim found
+        }
+    }
+}
+
+impl<K, V> Database<K, V>
+where
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + std::hash::Hash
+        + Eq
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + std::borrow::Borrow<str>
+        + MemSize,
+    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
 {
     /// Creates a new `DatabaseBuilder` to configure and build a `Database`.
     pub fn builder() -> DatabaseBuilder<K, V> {
@@ -368,6 +458,7 @@ where
     /// handle for each task that needs to interact with the database.
     pub fn handle(&self) -> Handle<'_, K, V> {
         Handle {
+            db: self,
             skiplist: &self.skiplist,
             active_tx: None,
             persistence_engine: &self.persistence_engine,
@@ -392,9 +483,19 @@ where
 /// automatically rolled back to ensure data consistency.
 pub struct Handle<'db, K, V>
 where
-    K: Ord + Clone + Send + Sync + 'static + std::hash::Hash + Eq + Serialize + DeserializeOwned,
-    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned,
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + std::hash::Hash
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + MemSize,
+    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
+    db: &'db Database<K, V>,
     skiplist: &'db Arc<SkipList<K, V>>,
     /// The currently active transaction, if one has been explicitly started.
     #[cfg(test)]
@@ -406,8 +507,17 @@ where
 
 impl<'db, K, V> Drop for Handle<'db, K, V>
 where
-    K: Ord + Clone + Send + Sync + 'static + std::hash::Hash + Eq + Serialize + DeserializeOwned,
-    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned,
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + std::hash::Hash
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + MemSize,
+    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
     /// Ensures that any active transaction is rolled back when the handle is dropped.
     fn drop(&mut self) {
@@ -420,8 +530,17 @@ where
 
 impl<'db, K, V> Handle<'db, K, V>
 where
-    K: Ord + Clone + Send + Sync + 'static + std::hash::Hash + Eq + Serialize + DeserializeOwned,
-    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned,
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + std::hash::Hash
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + MemSize,
+    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
     /// Retrieves a value from the database.
     ///
@@ -514,7 +633,7 @@ where
                 workspace.insert(key.clone(), Some(Arc::new(value.clone())));
                 let mut serialized_data = Vec::new();
                 ciborium::into_writer(&workspace, &mut serialized_data)
-                    .map_err(|e| FluxError::PersistenceError(e.to_string()))?;
+                    .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
                 if let Err(e) = engine.log(&serialized_data) {
                     tx_manager.abort(&tx);
                     return Err(e.into());
@@ -524,6 +643,7 @@ where
             // In autocommit, we write directly to the skiplist's pending versions.
             self.skiplist.insert(key, Arc::new(value), &tx).await;
             tx_manager.commit(&tx).unwrap();
+            self.db.evict_if_needed().await;
         }
         Ok(())
     }
@@ -583,7 +703,7 @@ where
                 workspace.insert(key.clone(), None); // None signifies removal
                 let mut serialized_data = Vec::new();
                 ciborium::into_writer(&workspace, &mut serialized_data)
-                    .map_err(|e| FluxError::PersistenceError(e.to_string()))?;
+                    .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
                 if let Err(e) = engine.log(&serialized_data) {
                     tx_manager.abort(&tx);
                     return Err(e.into());
@@ -593,6 +713,112 @@ where
             let result = self.skiplist.remove(key, &tx).await;
             tx_manager.commit(&tx).unwrap();
             Ok(result)
+        }
+    }
+
+    /// Scans a range of keys and returns the visible versions as a `Vec`.
+    ///
+    /// This operation is performed within the handle's active transaction if one exists,
+    /// or in a new, short-lived transaction if not. All keys returned are added to the
+    /// transaction's read set to ensure serializability. This method respects
+    /// Read-Your-Own-Writes (RYOW).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use fluxmap::db::Database;
+    /// # use std::sync::Arc;
+    /// #
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// # let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+    /// let mut handle = db.handle();
+    /// handle.insert("a".to_string(), 1).await.unwrap();
+    /// handle.insert("c".to_string(), 3).await.unwrap();
+    ///
+    /// handle.begin().unwrap();
+    /// handle.insert("b".to_string(), 2).await.unwrap(); // Uncommitted
+    ///
+    /// let results = handle.range(&"a".to_string(), &"c".to_string());
+    /// assert_eq!(results.len(), 3); // Sees the uncommitted "b"
+    /// assert_eq!(results[1].0, "b");
+    /// # handle.commit().await.unwrap();
+    /// # }
+    /// ```
+    pub fn range(&self, start: &K, end: &K) -> Vec<(K, Arc<V>)> {
+        if let Some(active_tx) = &self.active_tx {
+            // --- Explicit Transaction Path with RYOW ---
+            // TODO: Implement full range-locking to prevent phantom reads for true SSI.
+            // For now, we record every key we read, which prevents some but not all anomalies.
+
+            // 1. Get results from the persistent skiplist.
+            let mut results: BTreeMap<K, Arc<V>> = self
+                .skiplist
+                .range(start, end, active_tx)
+                .into_iter()
+                .collect();
+
+            // 2. Merge with the transaction's workspace.
+            let workspace = active_tx.workspace.read().unwrap();
+            for (key, value) in workspace.iter() {
+                if key >= start && key <= end {
+                    match value {
+                        Some(v) => {
+                            // Insert/update from workspace
+                            results.insert(key.clone(), v.clone());
+                        }
+                        None => {
+                            // Deletion from workspace
+                            results.remove(key);
+                        }
+                    }
+                }
+            }
+            results.into_iter().collect()
+        } else {
+            // --- Autocommit Path ---
+            let tx_manager = self.skiplist.transaction_manager();
+            let tx = tx_manager.begin();
+            let results = self.skiplist.range(start, end, &tx);
+            tx_manager.commit(&tx).unwrap(); // Autocommit always succeeds
+            results
+        }
+    }
+
+    /// Returns a stream that yields visible key-value pairs within a given range.
+    ///
+    /// This operation is performed within the handle's active transaction if one exists,
+    /// or in a new, short-lived transaction if not. All keys yielded by the stream are
+    /// added to the transaction's read set. This method respects Read-Your-Own-Writes (RYOW).
+    ///
+    /// **Note:** In an explicit transaction, this method currently buffers all results
+    /// internally to correctly merge changes from the transaction's workspace. It does
+    /// not provide true end-to-end streaming in that case.
+    pub fn range_stream<'a>(
+        &'a self,
+        start: &'a K,
+        end: &'a K,
+    ) -> impl futures::stream::Stream<Item = (K, Arc<V>)> + 'a {
+        async_stream::stream! {
+            if self.active_tx.is_some() {
+                // --- Explicit Transaction Path with RYOW ---
+                // Note: This is not a true stream as it buffers results to handle RYOW.
+                // A true streaming implementation would require a complex merge iterator.
+                let results = self.range(start, end);
+                for item in results {
+                    yield item;
+                }
+            } else {
+                // --- Autocommit Path (can be a true stream) ---
+                let tx_manager = self.skiplist.transaction_manager();
+                let tx = tx_manager.begin();
+                let stream = self.skiplist.range_stream(start, end, &tx);
+                futures::pin_mut!(stream);
+                while let Some(item) = stream.next().await {
+                    yield item;
+                }
+                tx_manager.commit(&tx).unwrap();
+            }
         }
     }
 
@@ -634,13 +860,13 @@ where
             if !workspace.is_empty() {
                 let mut serialized_data = Vec::new();
                 ciborium::into_writer(&*workspace, &mut serialized_data)
-                    .map_err(|e| FluxError::PersistenceError(e.to_string()))?;
+                    .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
 
                 if let Err(e) = engine.log(&serialized_data) {
                     // If logging fails, we must abort the transaction.
                     let tx_manager = self.skiplist.transaction_manager();
                     tx_manager.abort(&active_tx);
-                    return Err(FluxError::PersistenceError(e.to_string()));
+                    return Err(e.into());
                 }
             }
         }
@@ -663,7 +889,10 @@ where
         // Attempt to commit via the transaction manager, which performs SSI checks.
         let tx_manager = self.skiplist.transaction_manager();
         match tx_manager.commit(&active_tx) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.db.evict_if_needed().await;
+                Ok(())
+            }
             Err(e) => {
                 // If commit fails, the transaction is automatically aborted by the manager.
                 Err(e)
@@ -745,6 +974,99 @@ where
                 // which shouldn't happen here. We prioritize the closure's error.
             });
             result // Return the closure's Err result.
+        }
+    }
+}
+
+impl<'db, K, V> Handle<'db, K, V>
+where
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + std::hash::Hash
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + MemSize
+        + Borrow<str>,
+    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
+{
+    /// Scans for keys starting with a given prefix and returns the visible versions as a `Vec`.
+    ///
+    /// This operation is performed within the handle's active transaction if one exists,
+    /// or in a new, short-lived transaction if not. All keys returned are added to the
+    /// transaction's read set. This method respects Read-Your-Own-Writes (RYOW).
+    pub fn prefix_scan(&self, prefix: &str) -> Vec<(K, Arc<V>)> {
+        if let Some(active_tx) = &self.active_tx {
+            // --- Explicit Transaction Path with RYOW ---
+            // 1. Get results from the persistent skiplist.
+            let mut results: BTreeMap<K, Arc<V>> = self
+                .skiplist
+                .prefix_scan(prefix, active_tx)
+                .into_iter()
+                .collect();
+
+            // 2. Merge with the transaction's workspace.
+            let workspace = active_tx.workspace.read().unwrap();
+            for (key, value) in workspace.iter() {
+                if key.borrow().starts_with(prefix) {
+                    match value {
+                        Some(v) => {
+                            // Insert/update from workspace
+                            results.insert(key.clone(), v.clone());
+                        }
+                        None => {
+                            // Deletion from workspace
+                            results.remove(key.borrow());
+                        }
+                    }
+                }
+            }
+            results.into_iter().collect()
+        } else {
+            // --- Autocommit Path ---
+            let tx_manager = self.skiplist.transaction_manager();
+            let tx = tx_manager.begin();
+            let results = self.skiplist.prefix_scan(prefix, &tx);
+            tx_manager.commit(&tx).unwrap();
+            results
+        }
+    }
+
+    /// Returns a stream that yields visible key-value pairs for keys starting with a given prefix.
+    ///
+    /// This operation is performed within the handle's active transaction if one exists,
+    /// or in a new, short-lived transaction if not. All keys yielded by the stream are
+    /// added to the transaction's read set. This method respects Read-Your-Own-Writes (RYOW).
+    ///
+    /// **Note:** In an explicit transaction, this method currently buffers all results
+    /// internally to correctly merge changes from the transaction's workspace. It does
+    /// not provide true end-to-end streaming in that case.
+    pub fn prefix_scan_stream<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> impl futures::stream::Stream<Item = (K, Arc<V>)> + 'a {
+        async_stream::stream! {
+            if self.active_tx.is_some() {
+                // --- Explicit Transaction Path with RYOW ---
+                // Note: This is not a true stream as it buffers results to handle RYOW.
+                let results = self.prefix_scan(prefix);
+                for item in results {
+                    yield item;
+                }
+            } else {
+                // --- Autocommit Path (can be a true stream) ---
+                let tx_manager = self.skiplist.transaction_manager();
+                let tx = tx_manager.begin();
+                let stream = self.skiplist.prefix_scan_stream(prefix, &tx);
+                futures::pin_mut!(stream);
+                while let Some(item) = stream.next().await {
+                    yield item;
+                }
+                tx_manager.commit(&tx).unwrap();
+            }
         }
     }
 }

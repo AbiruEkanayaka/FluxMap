@@ -4,9 +4,9 @@
 //! that are no longer visible to any active or future transaction. This prevents
 //! unbounded memory growth in workloads with frequent updates or deletes.
 
-use crate::SkipList;
+use crate::{mem::MemSize, SkipList};
 use crate::transaction::TransactionStatus;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 use std::sync::atomic::Ordering;
 
 impl<K, V> SkipList<K, V>
@@ -18,10 +18,10 @@ where
         + 'static
         + std::hash::Hash
         + Eq
-        + std::borrow::Borrow<str>
         + Serialize
-        + DeserializeOwned,
-    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned,
+        + DeserializeOwned
+        + MemSize,
+    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
     /// Scans the database and removes dead data versions to reclaim space.
     ///

@@ -3,10 +3,13 @@ use futures::pin_mut;
 use futures::StreamExt;
 use rand::{Rng, SeedableRng};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 #[tokio::test]
 async fn test_new_skip_list() {
-    let skip_list: SkipList<String, String> = SkipList::new();
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list: SkipList<String, String> = SkipList::new(mem, clock);
     assert_eq!(skip_list.len(), 0);
     assert!(skip_list.is_empty());
     // assert_eq!(skip_list.level.load(Ordering::Relaxed), 0); // level is private
@@ -14,13 +17,17 @@ async fn test_new_skip_list() {
 
 #[tokio::test]
 async fn test_default() {
-    let skip_list: SkipList<String, String> = SkipList::default();
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list: SkipList<String, String> = SkipList::new(mem, clock);
     assert!(skip_list.is_empty());
 }
 
 #[tokio::test]
 async fn test_insert_and_get() {
-    let skip_list: SkipList<String, String> = SkipList::new();
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list: SkipList<String, String> = SkipList::new(mem, clock);
     let tx_manager = skip_list.transaction_manager();
 
     // Writer Transaction
@@ -56,7 +63,9 @@ async fn test_insert_and_get() {
 
 #[tokio::test]
 async fn test_insert_duplicate_key() {
-    let skip_list: SkipList<String, String> = SkipList::new();
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list: SkipList<String, String> = SkipList::new(mem, clock);
     let tx_manager = skip_list.transaction_manager();
 
     let writer_tx = tx_manager.begin();
@@ -78,7 +87,9 @@ async fn test_insert_duplicate_key() {
 
 #[tokio::test]
 async fn test_update_value() {
-    let skip_list: SkipList<String, String> = SkipList::new();
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list: SkipList<String, String> = SkipList::new(mem, clock);
     let tx_manager = skip_list.transaction_manager();
 
     let writer_tx_1 = tx_manager.begin();
@@ -114,14 +125,18 @@ async fn test_update_value() {
 
 #[tokio::test]
 async fn test_get_empty() {
-    let skip_list: SkipList<String, String> = SkipList::new();
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list: SkipList<String, String> = SkipList::new(mem, clock);
     let tx = skip_list.transaction_manager().begin();
     assert!(skip_list.get(&"a".to_string(), &tx).is_none());
 }
 
 #[tokio::test]
 async fn test_remove() {
-    let skip_list: SkipList<String, String> = SkipList::new();
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list: SkipList<String, String> = SkipList::new(mem, clock);
     let tx_manager = skip_list.transaction_manager();
 
     let writer_tx = tx_manager.begin();
@@ -168,7 +183,9 @@ async fn test_remove() {
 
 #[tokio::test]
 async fn test_contains_key() {
-    let skip_list: SkipList<String, String> = SkipList::new();
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list: SkipList<String, String> = SkipList::new(mem, clock);
     let tx_manager = skip_list.transaction_manager();
 
     let writer_tx = tx_manager.begin();
@@ -189,7 +206,9 @@ async fn test_contains_key() {
 
 #[tokio::test]
 async fn test_range() {
-    let skip_list: SkipList<String, String> = SkipList::new();
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list: SkipList<String, String> = SkipList::new(mem, clock);
     let tx_manager = skip_list.transaction_manager();
 
     let writer_tx = tx_manager.begin();
@@ -211,19 +230,21 @@ async fn test_range() {
     tx_manager.commit(&writer_tx).unwrap();
 
     let reader_tx = tx_manager.begin();
-    let range = skip_list.range(&"b".to_string(), &"d".to_string(), &reader_tx.snapshot);
+    let range = skip_list.range(&"b".to_string(), &"d".to_string(), &reader_tx);
     assert_eq!(range.len(), 3);
     assert_eq!(range[0].0, "b".to_string());
     assert_eq!(range[1].0, "c".to_string());
     assert_eq!(range[2].0, "d".to_string());
 
-    let range_all = skip_list.range(&"a".to_string(), &"z".to_string(), &reader_tx.snapshot);
+    let range_all = skip_list.range(&"a".to_string(), &"z".to_string(), &reader_tx);
     assert_eq!(range_all.len(), 5);
 }
 
 #[tokio::test]
 async fn test_prefix_scan() {
-    let skip_list: SkipList<String, String> = SkipList::new();
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list: SkipList<String, String> = SkipList::new(mem, clock);
     let tx_manager = skip_list.transaction_manager();
 
     let writer_tx = tx_manager.begin();
@@ -242,18 +263,20 @@ async fn test_prefix_scan() {
     tx_manager.commit(&writer_tx).unwrap();
 
     let reader_tx = tx_manager.begin();
-    let scan = skip_list.prefix_scan("app", &reader_tx.snapshot);
+    let scan = skip_list.prefix_scan("app", &reader_tx);
     assert_eq!(scan.len(), 2);
     assert_eq!(scan[0].0, "apple".to_string());
     assert_eq!(scan[1].0, "apply".to_string());
 
-    let scan2 = skip_list.prefix_scan("ban", &reader_tx.snapshot);
+    let scan2 = skip_list.prefix_scan("ban", &reader_tx);
     assert_eq!(scan2.len(), 2);
 }
 
 #[tokio::test]
 async fn test_range_stream() {
-    let skip_list: SkipList<String, String> = SkipList::new();
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list: SkipList<String, String> = SkipList::new(mem, clock);
     let tx_manager = skip_list.transaction_manager();
 
     let writer_tx = tx_manager.begin();
@@ -277,7 +300,7 @@ async fn test_range_stream() {
     let reader_tx = tx_manager.begin();
     let start_key = "b".to_string();
     let end_key = "d".to_string();
-    let range_stream = skip_list.range_stream(&start_key, &end_key, &reader_tx.snapshot);
+    let range_stream = skip_list.range_stream(&start_key, &end_key, &reader_tx);
     pin_mut!(range_stream);
     assert_eq!(range_stream.next().await.unwrap().0, "b".to_string());
     assert_eq!(range_stream.next().await.unwrap().0, "c".to_string());
@@ -287,7 +310,9 @@ async fn test_range_stream() {
 
 #[tokio::test]
 async fn test_prefix_scan_stream() {
-    let skip_list: SkipList<String, String> = SkipList::new();
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list: SkipList<String, String> = SkipList::new(mem, clock);
     let tx_manager = skip_list.transaction_manager();
 
     let writer_tx = tx_manager.begin();
@@ -304,7 +329,7 @@ async fn test_prefix_scan_stream() {
 
     let reader_tx = tx_manager.begin();
     let prefix_key = "app".to_string();
-    let scan_stream = skip_list.prefix_scan_stream(&prefix_key, &reader_tx.snapshot);
+    let scan_stream = skip_list.prefix_scan_stream(&prefix_key, &reader_tx);
     pin_mut!(scan_stream);
     assert_eq!(scan_stream.next().await.unwrap().0, "apple".to_string());
     assert_eq!(scan_stream.next().await.unwrap().0, "apply".to_string());
@@ -313,7 +338,9 @@ async fn test_prefix_scan_stream() {
 
 #[tokio::test]
 async fn test_concurrent_insert() {
-    let skip_list = Arc::new(SkipList::new());
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list = Arc::new(SkipList::new(mem, clock));
     let tx_manager = skip_list.transaction_manager().clone();
     let mut tasks = vec![];
 
@@ -338,7 +365,9 @@ async fn test_concurrent_insert() {
 
 #[tokio::test]
 async fn test_concurrent_insert_and_remove() {
-    let skip_list = Arc::new(SkipList::new());
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list = Arc::new(SkipList::new(mem, clock));
     let tx_manager = skip_list.transaction_manager().clone();
 
     // Insert 1000 items.
@@ -386,7 +415,9 @@ async fn test_concurrent_insert_and_remove() {
 
 #[tokio::test]
 async fn test_stress_concurrent_operations() {
-    let skip_list = Arc::new(SkipList::<String, String>::new());
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list = Arc::new(SkipList::<String, String>::new(mem, clock));
     let tx_manager = skip_list.transaction_manager().clone();
     let num_tasks = 100;
     let ops_per_task = 100;
@@ -418,7 +449,7 @@ async fn test_stress_concurrent_operations() {
                         let end = rng
                             .gen_range(start.parse::<i32>().unwrap()..key_range)
                             .to_string();
-                        let range = skip_list.range(&start, &end, &tx.snapshot);
+                        let range = skip_list.range(&start, &end, &tx);
                         // Check that the snapshot is consistent.
                         for i in 0..range.len().saturating_sub(1) {
                             assert!(range[i].0 <= range[i + 1].0);
@@ -426,7 +457,7 @@ async fn test_stress_concurrent_operations() {
                     }
                     4 => {
                         let prefix = rng.gen_range(0..key_range).to_string();
-                        let scan = skip_list.prefix_scan(&prefix, &tx.snapshot);
+                        let scan = skip_list.prefix_scan(&prefix, &tx);
                         // Check that the snapshot is consistent.
                         for (key, _) in scan {
                             assert!(key.starts_with(&prefix));
@@ -446,7 +477,9 @@ async fn test_stress_concurrent_operations() {
 
 #[tokio::test]
 async fn test_concurrent_range_stream_modifications() {
-    let skip_list = Arc::new(SkipList::<String, String>::new());
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list = Arc::new(SkipList::<String, String>::new(mem, clock));
     let tx_manager = skip_list.transaction_manager().clone();
     let num_modifiers = 10;
     let ops_per_modifier = 100;
@@ -482,7 +515,7 @@ async fn test_concurrent_range_stream_modifications() {
     let start_key = "10".to_string();
     let end_key = "50".to_string();
     let tx = tx_manager.begin();
-    let stream = skip_list.range_stream(&start_key, &end_key, &tx.snapshot);
+    let stream = skip_list.range_stream(&start_key, &end_key, &tx);
     pin_mut!(stream);
 
     let mut prev_key = None;
@@ -503,7 +536,9 @@ async fn test_concurrent_range_stream_modifications() {
 
 #[tokio::test]
 async fn test_concurrent_prefix_scan_modifications() {
-    let skip_list = Arc::new(SkipList::<String, String>::new());
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list = Arc::new(SkipList::<String, String>::new(mem, clock));
     let tx_manager = skip_list.transaction_manager().clone();
     let num_modifiers = 10;
     let ops_per_modifier = 100;
@@ -538,7 +573,7 @@ async fn test_concurrent_prefix_scan_modifications() {
     // Run prefix scan stream on the main thread while modifications are happening
     let prefix = "1".to_string(); // Scan for keys starting with '1'
     let tx = tx_manager.begin();
-    let stream = skip_list.prefix_scan_stream(&prefix, &tx.snapshot);
+    let stream = skip_list.prefix_scan_stream(&prefix, &tx);
     pin_mut!(stream);
 
     let mut prev_key = None;
@@ -559,7 +594,9 @@ async fn test_concurrent_prefix_scan_modifications() {
 
 #[tokio::test]
 async fn test_write_skew_prevention() {
-    let skip_list = Arc::new(SkipList::<String, i32>::new());
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list = Arc::new(SkipList::<String, i32>::new(mem, clock));
     let tx_manager = skip_list.transaction_manager();
 
     // Initialize two keys, x and y, with a sum of 100.
@@ -637,7 +674,9 @@ async fn test_write_skew_prevention() {
 
 #[tokio::test]
 async fn test_vacuum() {
-    let skip_list = Arc::new(SkipList::<String, i32>::new());
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list = Arc::new(SkipList::<String, i32>::new(mem, clock));
     let tx_manager = skip_list.transaction_manager();
 
     // Tx1: Insert x=10, y=20
@@ -701,7 +740,9 @@ async fn test_vacuum() {
 
 #[tokio::test]
 async fn test_vacuum_removes_node() {
-    let skip_list = Arc::new(SkipList::<String, i32>::new());
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list = Arc::new(SkipList::<String, i32>::new(mem, clock));
     let tx_manager = skip_list.transaction_manager();
 
     // Tx1: Insert "a"
@@ -738,7 +779,9 @@ async fn test_vacuum_removes_node() {
 
 #[tokio::test]
 async fn test_remove_respects_snapshot() {
-    let skip_list = Arc::new(SkipList::<String, i32>::new());
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list = Arc::new(SkipList::<String, i32>::new(mem, clock));
     let tx_manager = skip_list.transaction_manager();
 
     // Tx1: Insert "a" with value 1
@@ -796,7 +839,9 @@ async fn test_remove_respects_snapshot() {
 
 #[tokio::test]
 async fn test_vacuum_handles_uncommitted_expirer() {
-    let skip_list = Arc::new(SkipList::<String, i32>::new());
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list = Arc::new(SkipList::<String, i32>::new(mem, clock));
     let tx_manager = skip_list.transaction_manager();
 
     // Tx1: Insert "a" with value 1 and commit.
@@ -855,7 +900,9 @@ async fn test_vacuum_handles_uncommitted_expirer() {
 
 #[tokio::test]
 async fn test_transaction_status_pruning() {
-    let skip_list = Arc::new(SkipList::<String, i32>::new());
+    let mem = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(AtomicU64::new(0));
+    let skip_list = Arc::new(SkipList::<String, i32>::new(mem, clock));
     let tx_manager = skip_list.transaction_manager();
 
     let num_transactions = 100;

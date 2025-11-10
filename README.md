@@ -72,9 +72,23 @@ use fluxmap::db::Database;
 use fluxmap::error::FluxError;
 use std::sync::Arc;
 
+// It's good practice to define a custom error type for your application.
+#[derive(Debug)]
+enum AppError {
+    InsufficientFunds,
+    DbError(FluxError),
+}
+
+// Implement From<FluxError> to allow the `?` operator to work inside the transaction.
+impl From<FluxError> for AppError {
+    fn from(e: FluxError) -> Self {
+        AppError::DbError(e)
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), FluxError> {
-    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+async fn main() -> Result<(), AppError> {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await?);
     let mut handle = db.handle();
 
     // Account balances
@@ -82,7 +96,7 @@ async fn main() -> Result<(), FluxError> {
     handle.insert("bob".to_string(), 100).await?;
 
     // Atomically transfer 20 from Alice to Bob
-    let result: Result<&str, FluxError> = handle.transaction(|h| Box::pin(async move {
+    let result = handle.transaction(|h| Box::pin(async move {
         let alice_balance = h.get(&"alice".to_string()).unwrap();
         let bob_balance = h.get(&"bob".to_string()).unwrap();
 
@@ -91,13 +105,16 @@ async fn main() -> Result<(), FluxError> {
             h.insert("bob".to_string(), *bob_balance + 20).await?;
             Ok("Transfer successful!")
         } else {
-            Err(FluxError::PersistenceError("Insufficient funds!".to_string())) // Returning an Err will automatically roll back
+            Err(AppError::InsufficientFunds) // Return our custom error
         }
     })).await;
 
     match result {
         Ok(msg) => println!("{}", msg),
-        Err(e) => println!("Transfer failed: {}", e),
+        Err(e) => match e {
+            AppError::InsufficientFunds => println!("Transfer failed: Not enough money!"),
+            AppError::DbError(db_err) => println!("Transfer failed due to a database error: {}", db_err),
+        }
     }
 
     // Verify the final state

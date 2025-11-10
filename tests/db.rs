@@ -1,6 +1,6 @@
 use fluxmap::db::Database;
 use fluxmap::error::FluxError;
-use fluxmap::persistence::{DurabilityLevel, PersistenceOptions};
+use fluxmap::persistence::PersistenceOptions;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -375,4 +375,78 @@ async fn test_recovery_on_startup() {
     // Verify that the data from the first session is present.
     assert_eq!(*handle.get(&"key1".to_string()).unwrap(), 1);
     assert_eq!(*handle.get(&"key2".to_string()).unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_autocommit_range_scan() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+    let handle = db.handle();
+    handle.insert("a".to_string(), 1).await.unwrap();
+    handle.insert("b".to_string(), 2).await.unwrap();
+    handle.insert("c".to_string(), 3).await.unwrap();
+
+    let results = handle.range(&"a".to_string(), &"b".to_string());
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, "a");
+    assert_eq!(*results[1].1, 2);
+}
+
+#[tokio::test]
+async fn test_transactional_prefix_scan() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+    let mut handle = db.handle();
+    handle.insert("user:1".to_string(), 100).await.unwrap();
+    handle.insert("user:2".to_string(), 200).await.unwrap();
+    handle.insert("item:1".to_string(), 999).await.unwrap();
+
+    handle.begin().unwrap();
+    // In transaction, update a value that will be part of the scan
+    handle.insert("user:3".to_string(), 300).await.unwrap();
+
+    let results = handle.prefix_scan("user:");
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().any(|(k, _)| k == "user:1"));
+    assert!(results.iter().any(|(k, _)| k == "user:2"));
+    assert!(results.iter().any(|(k, v)| k == "user:3" && **v == 300));
+
+    handle.commit().await.unwrap();
+
+    // Verify after commit
+    let final_results = db.handle().prefix_scan("user:");
+    assert_eq!(final_results.len(), 3);
+}
+
+#[tokio::test]
+async fn test_scan_induces_serialization_conflict() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+
+    // Setup: insert a key in the range
+    let setup_handle = db.handle();
+    setup_handle.insert("b".to_string(), 10).await.unwrap();
+
+    let mut h1 = db.handle();
+    let mut h2 = db.handle();
+
+    // Tx1 starts and scans a range including "b"
+    h1.begin().unwrap();
+    let range = h1.range(&"a".to_string(), &"c".to_string());
+    assert_eq!(range.len(), 1);
+    assert_eq!(range[0].0, "b");
+
+    // Tx2 starts, writes to "b" (which Tx1 has read via the scan), and commits.
+    h2.begin().unwrap();
+    h2.insert("b".to_string(), 20).await.unwrap();
+    let res2 = h2.commit().await;
+    assert!(res2.is_ok(), "Tx2 should commit successfully");
+
+    // Now, when Tx1 tries to commit, it should fail because its read set (containing "b")
+    // conflicts with Tx2's write.
+    let res1 = h1.commit().await;
+    assert!(res1.is_err());
+    assert_eq!(res1.unwrap_err(), FluxError::SerializationConflict);
+
+    // Check final state
+    let final_handle = db.handle();
+    let final_b = final_handle.get(&"b".to_string()).unwrap();
+    assert_eq!(*final_b, 20); // from tx2
 }

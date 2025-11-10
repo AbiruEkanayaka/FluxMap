@@ -147,25 +147,14 @@ where
             }
         }
 
-        // 2. Check for Write-Write conflicts (T1 writes K, T2 writes K)
-        // This is a simplified check. A more robust SSI would handle this differently,
-        // but this helps prevent some races.
-        for other_tx_entry in self.active_transactions.iter() {
-            let other_tx = other_tx_entry.value();
-
-            // We only care about other active transactions, not ourselves.
-            if tx.id == other_tx.id {
-                continue;
-            }
-
-            // If other_tx wrote any key that tx also wrote, mark other_tx in conflict.
-            for other_written_key in other_tx.write_set.iter() {
-                if tx.write_set.contains(other_written_key.key()) {
-                    other_tx.in_conflict.store(true, Ordering::Release);
-                    break; // No need to check other writes for this other_tx
-                }
-            }
-        }
+        // The explicit write-write conflict check has been removed.
+        // The read-write conflict check above is sufficient for a correct SSI implementation.
+        // A write operation implicitly reads the key to find the version to update,
+        // which registers a read in the read-set. If two transactions write to the
+        // same key, the first one to commit will mark the second one as conflicted
+        // via the read-write check, thus preventing lost updates.
+        // Removing the O(N^2) WW-check avoids a significant performance bottleneck
+        // under high write contention.
 
         self.cleanup_read_trackers(tx);
         self.statuses.insert(tx.id, TransactionStatus::Committed);

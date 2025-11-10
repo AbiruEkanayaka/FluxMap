@@ -17,10 +17,36 @@ pub enum FluxError {
     TransactionAlreadyActive,
     /// Occurs when `commit()` or `rollback()` is called on a `Handle` with no active transaction.
     NoActiveTransaction,
-    /// Wraps an error originating from the persistence layer, such as an I/O error
-    /// during WAL writing, snapshotting, or recovery.
-    PersistenceError(String),
+    /// Wraps an error originating from the persistence layer.
+    Persistence(PersistenceError),
+    /// Represents an error during the key eviction process, e.g., no victim could be found.
+    EvictionError,
+    /// Represents an error in the database configuration.
+    Configuration(String),
 }
+
+/// A specific error originating from the persistence layer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PersistenceError {
+    /// An underlying I/O error from the filesystem.
+    Io(String),
+    /// An error during data serialization or deserialization (e.g., for the WAL or snapshots).
+    Serialization(String),
+    /// An error that occurred during the database recovery process.
+    Recovery(String),
+}
+
+impl fmt::Display for PersistenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PersistenceError::Io(e) => write!(f, "I/O error: {}", e),
+            PersistenceError::Serialization(e) => write!(f, "Serialization error: {}", e),
+            PersistenceError::Recovery(e) => write!(f, "Recovery error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for PersistenceError {}
 
 impl fmt::Display for FluxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -34,7 +60,9 @@ impl fmt::Display for FluxError {
             FluxError::NoActiveTransaction => {
                 write!(f, "No active transaction on this handle")
             }
-            FluxError::PersistenceError(e) => write!(f, "Persistence error: {}", e),
+            FluxError::Persistence(e) => write!(f, "Persistence error: {}", e),
+            FluxError::EvictionError => write!(f, "Eviction error: could not find or evict a key"),
+            FluxError::Configuration(e) => write!(f, "Configuration error: {}", e),
         }
     }
 }
@@ -43,6 +71,6 @@ impl std::error::Error for FluxError {}
 
 impl From<io::Error> for FluxError {
     fn from(err: io::Error) -> Self {
-        FluxError::PersistenceError(err.to_string())
+        FluxError::Persistence(PersistenceError::Io(err.to_string()))
     }
 }

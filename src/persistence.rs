@@ -22,10 +22,11 @@
 //!     replays any subsequent WAL segments to restore the database to its last known
 //!     consistent state.
 
+use crate::mem::MemSize;
 use crate::SkipList;
 use crate::transaction::Workspace;
-use rustix::fs::FallocateFlags;
 use rustix::fs::fallocate;
+use rustix::fs::FallocateFlags;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -33,9 +34,8 @@ use std::io::{self, BufReader, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    mpsc,
+    mpsc, Arc, Mutex,
 };
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -135,8 +135,8 @@ impl Clone for WalSegment {
 /// A snapshot of the database state at a specific point in time.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(bound(
-    serialize = "K: Eq + std::hash::Hash + Serialize, V: Serialize",
-    deserialize = "K: Eq + std::hash::Hash + Deserialize<'de>, V: Deserialize<'de>"
+    serialize = "K: Eq + std::hash::Hash + Serialize + MemSize, V: Serialize + MemSize",
+    deserialize = "K: Eq + std::hash::Hash + Deserialize<'de> + MemSize, V: Deserialize<'de> + MemSize"
 ))]
 struct SnapshotData<K, V> {
     /// The index of the last WAL segment that was successfully incorporated into this snapshot.
@@ -145,7 +145,7 @@ struct SnapshotData<K, V> {
     data: HashMap<K, Arc<V>>,
 }
 
-impl<K, V> Default for SnapshotData<K, V> {
+impl<K: MemSize, V: MemSize> Default for SnapshotData<K, V> {
     fn default() -> Self {
         Self {
             last_processed_segment_idx: None,
@@ -225,8 +225,9 @@ where
         + std::hash::Hash
         + Eq
         + Serialize
-        + for<'de> Deserialize<'de>,
-    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de>,
+        + for<'de> Deserialize<'de>
+        + MemSize,
+    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
 {
     /// Creates a new `PersistenceEngine` based on the provided `DurabilityLevel`.
     ///
@@ -294,8 +295,12 @@ where
                 let mut snapshot_data: SnapshotData<K, V> = if snapshot_path_clone.exists() {
                     match File::open(&snapshot_path_clone) {
                         Ok(file) => ciborium::from_reader(file).unwrap_or_else(|e| {
-                            eprintln!("Snapshotter: Failed to deserialize snapshot from {:?}: {}", snapshot_path_clone, e);
-                            SnapshotData::default()
+                            // A corrupted snapshot is a fatal error. We cannot safely proceed
+                            // as it would mean losing all previously snapshotted data.
+                            panic!(
+                                "FATAL: Snapshot file at {:?} is corrupted and could not be deserialized: {}. Manual intervention required.",
+                                snapshot_path_clone, e
+                            );
                         }),
                         Err(e) => {
                             eprintln!("Snapshotter: Failed to open existing snapshot file {:?}: {}", snapshot_path_clone, e);
@@ -463,8 +468,12 @@ where
     /// 3. Replaying the records from those WAL segments in order.
     ///
     /// The resulting `SkipList` contains the fully recovered state.
-    pub async fn recover(&self) -> Result<SkipList<K, V>, crate::error::FluxError> {
-        let skiplist = SkipList::new();
+    pub async fn recover(
+        &self,
+        current_memory_bytes: Arc<AtomicU64>,
+        access_clock: Arc<AtomicU64>,
+    ) -> Result<SkipList<K, V>, crate::error::FluxError> {
+        let skiplist = SkipList::new(current_memory_bytes, access_clock);
         let tx_manager = skiplist.transaction_manager();
 
         // 1. Load snapshot
@@ -655,7 +664,15 @@ where
         *self.wal_segments[current_idx].state.lock().unwrap() = WalSegmentState::PendingSnapshot;
 
         // Send the old segment to the snapshotter
-        self.snapshot_queue_tx.send(current_idx).unwrap();
+        if let Err(e) = self.snapshot_queue_tx.send(current_idx) {
+            eprintln!(
+                "FATAL: Snapshotter thread has died. Cannot send segment {} for snapshotting. Error: {}",
+                current_idx, e
+            );
+            // This is a critical error. The system can no longer guarantee durability
+            // or reclaim space. A real-world implementation might need to panic,
+            // enter a read-only mode, or shut down gracefully here.
+        }
 
         // Reset writer position and update current segment index
         self.writer_position.store(0, Ordering::Relaxed);
