@@ -95,7 +95,7 @@ pub struct VacuumOptions {
 /// # async fn main() {
 /// # let temp_dir = tempdir().unwrap();
 /// # let wal_path = temp_dir.path().to_path_buf();
-/// // A durable database with custom WAL settings and auto-vacuuming enabled.
+/// // A durable database with custom WAL settings, auto-vacuuming, and a memory limit.
 /// let db = Database::<String, String>::builder()
 ///     .durability_full(PersistenceOptions {
 ///         wal_path,
@@ -105,6 +105,7 @@ pub struct VacuumOptions {
 ///     .auto_vacuum(VacuumOptions {
 ///         interval: Duration::from_secs(30),
 ///     })
+///     .max_memory(512 * 1024 * 1024) // Set a 512MB memory limit
 ///     .build()
 ///     .await
 ///     .unwrap();

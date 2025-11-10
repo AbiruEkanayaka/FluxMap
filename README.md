@@ -22,6 +22,7 @@ It is designed for ease of use, high performance, and seamless integration into 
         -   `Full`: (fsync-per-transaction) Commits are flushed to disk before acknowledging, ensuring maximum safety.
 -   **Configurable Maintenance:**
     -   **Automatic Vacuuming:** Optional background thread to automatically clean up old data versions and reclaim memory.
+    -   **Memory Limiting:** Optional memory limit with LRU-based eviction to keep memory usage in check.
 -   **High Performance:** A lock-free skiplist implementation provides excellent performance for reads and low-contention writes.
 -   **Ergonomic API:** A clean and simple API for `get`, `insert`, and `remove` operations. Supports both simple autocommit operations and explicit, multi-statement transactions.
 -   **Range & Prefix Scans:** Efficiently query ranges of keys or keys with a specific prefix, with both `Vec` and `Stream`-based APIs.
@@ -179,6 +180,87 @@ async fn main() {
 }
 ```
 
+### Example 4: Prefix Scans
+
+Efficiently find all keys that start with a given prefix.
+
+```rust
+use fluxmap::db::Database;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+    let handle = db.handle();
+
+    handle.insert("user:alice".to_string(), 100).await.unwrap();
+    handle.insert("user:bob".to_string(), 200).await.unwrap();
+    handle.insert("item:a".to_string(), 99).await.unwrap();
+
+    // Find all keys starting with "user:"
+    let user_keys = handle.prefix_scan("user:");
+    assert_eq!(user_keys.len(), 2);
+    println!("Found users: {:?}", user_keys);
+}
+```
+
+### Example 5: Memory Limiting and Eviction
+
+Set a memory limit to automatically evict the least recently used (LRU) items when the database exceeds its capacity.
+
+```rust
+use fluxmap::db::Database;
+use fluxmap::mem::MemSize;
+use std::sync::Arc;
+
+// Your key and value types must implement `MemSize` for memory limiting to work.
+// For this example, we'll use simple types that already have it implemented.
+// For custom structs, you would implement it like this:
+//
+// #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+// struct MyValue {
+//     data: String,
+//     num: u64,
+// }
+//
+// impl MemSize for MyValue {
+//     fn mem_size(&self) -> usize {
+//         std::mem::size_of::<Self>() + self.data.capacity()
+//     }
+// }
+
+#[tokio::main]
+async fn main() {
+    // Set a small memory limit (e.g., 500 bytes) to demonstrate eviction.
+    let db: Arc<Database<String, String>> = Arc::new(
+        Database::builder()
+            .max_memory(500)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let handle = db.handle();
+
+    // Insert keys. The total memory size of a key-value pair will be estimated.
+    handle.insert("key1".to_string(), "a long value to take up space".to_string()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await; // Ensure distinct access times
+    handle.insert("key2".to_string(), "another long value to take up space".to_string()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    // Access key1 to make it the most recently used
+    let _ = handle.get(&"key1".to_string());
+
+    // Insert another key, which should push memory usage over the limit.
+    // This will trigger an eviction of the least recently used key ("key2").
+    handle.insert("key3".to_string(), "a final long value".to_string()).await.unwrap();
+
+    // "key2" should now be gone.
+    assert!(handle.get(&"key2".to_string()).is_none(), "key2 should be evicted");
+    assert!(handle.get(&"key1".to_string()).is_some(), "key1 should still exist");
+    println!("Eviction successful!");
+}
+```
+
 ## Core Concepts
 
 ### Configuration
@@ -197,7 +279,7 @@ use std::time::Duration;
 # async fn main() {
 # let temp_dir = tempdir().unwrap();
 # let wal_path = temp_dir.path().to_path_buf();
-// A durable database with relaxed (group commit) durability and auto-vacuuming.
+// A durable database with relaxed durability, auto-vacuuming, and a memory limit.
 let db = Database::<String, String>::builder()
     .durability_relaxed(PersistenceOptions {
         wal_path,
@@ -211,6 +293,7 @@ let db = Database::<String, String>::builder()
     .auto_vacuum(VacuumOptions {
         interval: Duration::from_secs(30), // Run vacuum every 30 seconds
     })
+    .max_memory(512 * 1024 * 1024) // Set a 512MB memory limit
     .build()
     .await
     .unwrap();
@@ -242,6 +325,43 @@ You can control the trade-off between performance and safety by configuring dura
 ### Automatic Vacuuming
 
 When configured via `auto_vacuum` on the builder, the database will spawn a background thread to periodically run the vacuum process. This reclaims memory from old, dead data versions. If not enabled, you can still call `db.vacuum()` manually.
+
+### Memory Limiting and Eviction
+
+You can configure a memory limit to prevent the database from growing indefinitely. When the estimated memory usage exceeds this limit, FluxMap will automatically evict the least recently used (LRU) keys to stay under the limit.
+
+To use this feature, your key and value types must implement the `fluxmap::mem::MemSize` trait, which helps the database estimate how much memory each entry consumes.
+
+```rust
+use fluxmap::db::Database;
+use fluxmap::mem::MemSize; // Don't forget to import the trait
+
+// For custom types, you need to implement MemSize.
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash, Ord, PartialOrd)]
+struct MyKey(String);
+
+impl std::borrow::Borrow<str> for MyKey {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl MemSize for MyKey {
+    fn mem_size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.0.capacity()
+    }
+}
+
+# #[tokio::main]
+# async fn main() {
+// Configure a 256MB limit.
+let db = Database::<MyKey, String>::builder()
+    .max_memory(256 * 1024 * 1024)
+    .build()
+    .await
+    .unwrap();
+# }
+```
 
 ## Under the Hood: MVCC and SSI
 
