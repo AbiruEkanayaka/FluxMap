@@ -431,8 +431,8 @@ async fn test_stress_concurrent_operations() {
             let mut rng = rand::rngs::StdRng::seed_from_u64(i as u64);
             let tx = tx_manager.begin();
             for _ in 0..ops_per_task {
-                let key = rng.gen_range(0..key_range);
-                match rng.gen_range(0..5) {
+                let key = rng.random_range(0..key_range);
+                match rng.random_range(0..5) {
                     0 => {
                         skip_list
                             .insert(key.to_string(), Arc::new(key.to_string()), &tx)
@@ -445,9 +445,9 @@ async fn test_stress_concurrent_operations() {
                         skip_list.remove(&key.to_string(), &tx).await;
                     }
                     3 => {
-                        let start = rng.gen_range(0..key_range).to_string();
+                        let start = rng.random_range(0..key_range).to_string();
                         let end = rng
-                            .gen_range(start.parse::<i32>().unwrap()..key_range)
+                            .random_range(start.parse::<i32>().unwrap()..key_range)
                             .to_string();
                         let range = skip_list.range(&start, &end, &tx);
                         // Check that the snapshot is consistent.
@@ -456,7 +456,7 @@ async fn test_stress_concurrent_operations() {
                         }
                     }
                     4 => {
-                        let prefix = rng.gen_range(0..key_range).to_string();
+                        let prefix = rng.random_range(0..key_range).to_string();
                         let scan = skip_list.prefix_scan(&prefix, &tx);
                         // Check that the snapshot is consistent.
                         for (key, _) in scan {
@@ -494,8 +494,8 @@ async fn test_concurrent_range_stream_modifications() {
             let mut rng = rand::rngs::StdRng::seed_from_u64(i as u64);
             let tx = tx_manager.begin();
             for _ in 0..ops_per_modifier {
-                let key = rng.gen_range(0..key_range).to_string();
-                match rng.gen_range(0..2) {
+                let key = rng.random_range(0..key_range).to_string();
+                match rng.random_range(0..2) {
                     0 => {
                         skip_list_clone
                             .insert(key.clone(), Arc::new(key.clone()), &tx)
@@ -553,8 +553,8 @@ async fn test_concurrent_prefix_scan_modifications() {
             let mut rng = rand::rngs::StdRng::seed_from_u64(i as u64);
             let tx = tx_manager.begin();
             for _ in 0..ops_per_modifier {
-                let key = rng.gen_range(0..key_range).to_string();
-                match rng.gen_range(0..2) {
+                let key = rng.random_range(0..key_range).to_string();
+                match rng.random_range(0..2) {
                     0 => {
                         skip_list_clone
                             .insert(key.clone(), Arc::new(key.clone()), &tx)
