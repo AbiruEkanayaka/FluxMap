@@ -862,7 +862,7 @@ where
         // --- Phase 1: In-Memory Application ---
         // Apply changes from the workspace to the actual skiplist.
         // This is provisional; the versions are not visible until the transaction status is Committed.
-        let workspace = active_tx.workspace.read().unwrap();
+        let workspace = active_tx.workspace.read().unwrap().clone();
         for (key, value) in workspace.iter() {
             match value {
                 Some(val) => {
@@ -884,7 +884,7 @@ where
             if let Some(engine) = persistence_engine {
                 if !workspace.is_empty() {
                     let mut serialized_data = Vec::new();
-                    ciborium::into_writer(&*workspace, &mut serialized_data)
+                    ciborium::into_writer(&workspace, &mut serialized_data)
                         .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
 
                     engine.log(&serialized_data)?;
@@ -981,23 +981,7 @@ where
             result // Return the closure's Err result.
         }
     }
-}
 
-impl<'db, K, V> Handle<'db, K, V>
-where
-    K: Ord
-        + Clone
-        + Send
-        + Sync
-        + 'static
-        + std::hash::Hash
-        + Eq
-        + Serialize
-        + DeserializeOwned
-        + MemSize
-        + Borrow<str>,
-    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
-{
     /// Scans for keys starting with a given prefix and returns the visible versions as a `Vec`.
     ///
     /// This operation is performed within the handle's active transaction if one exists,
@@ -1081,3 +1065,5 @@ where
         }
     }
 }
+
+
