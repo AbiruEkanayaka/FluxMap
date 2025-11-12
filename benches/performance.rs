@@ -85,12 +85,10 @@ fn bench_concurrent_writes(c: &mut Criterion) {
             BenchmarkId::from_parameter(num_tasks),
             &num_tasks,
             |b, &tasks_count| {
-                // A new DB is created for each iteration to avoid it growing indefinitely
-                let db =
-                    Arc::new(rt.block_on(Database::<u64, u64>::builder().build()).unwrap());
-
                 b.to_async(&rt).iter(|| async {
-                    let db = db.clone();
+                    // A new DB is created for each iteration to avoid it growing indefinitely
+                    let db =
+                        Arc::new(Database::<u64, u64>::builder().build().await.unwrap());
                     let barrier = Arc::new(Barrier::new(tasks_count));
                     let mut handles = Vec::new();
 
@@ -179,14 +177,6 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 /// Measures the time to complete a small, contentious transaction.
 fn bench_transaction_latency(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let db = Arc::new(rt.block_on(Database::<u64, u64>::builder().build()).unwrap());
-
-    // Setup two contentious keys
-    rt.block_on(async {
-        let handle = db.handle();
-        handle.insert(1, 100).await.unwrap();
-        handle.insert(2, 100).await.unwrap();
-    });
 
     let mut group = c.benchmark_group("Transaction Latency (Contention)");
     group.plot_config(PlotConfiguration::default().summary_scale(AxisScale::Logarithmic));
@@ -199,7 +189,14 @@ fn bench_transaction_latency(c: &mut Criterion) {
             &num_tasks,
             |b, &tasks_count| {
                 b.to_async(&rt).iter(|| async {
-                    let db = db.clone();
+                    let db =
+                        Arc::new(Database::<u64, u64>::builder().build().await.unwrap());
+
+                    // Setup two contentious keys
+                    let handle = db.handle();
+                    handle.insert(1, 100).await.unwrap();
+                    handle.insert(2, 100).await.unwrap();
+
                     let barrier = Arc::new(Barrier::new(tasks_count));
                     let mut handles = Vec::new();
 

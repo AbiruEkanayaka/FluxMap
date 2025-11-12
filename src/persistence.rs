@@ -35,7 +35,7 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc, Arc, Condvar, Mutex,
 };
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -120,7 +120,7 @@ pub enum WalSegmentState {
 #[derive(Debug)]
 struct WalSegment {
     file: Arc<Mutex<File>>,
-    state: Arc<Mutex<WalSegmentState>>,
+    state: Arc<(Mutex<WalSegmentState>, Condvar)>,
 }
 
 impl Clone for WalSegment {
@@ -209,7 +209,7 @@ fn setup_wal_files(options: &PersistenceOptions) -> io::Result<Vec<WalSegment>> 
 
         wal_segments.push(WalSegment {
             file: Arc::new(Mutex::new(file)),
-            state: Arc::new(Mutex::new(initial_state)),
+            state: Arc::new((Mutex::new(initial_state), Condvar::new())),
         });
     }
     Ok(wal_segments)
@@ -226,7 +226,8 @@ where
         + Eq
         + Serialize
         + for<'de> Deserialize<'de>
-        + MemSize,
+        + MemSize
+        + std::borrow::Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
 {
     /// Creates a new `PersistenceEngine` based on the provided `DurabilityLevel`.
@@ -264,25 +265,24 @@ where
         let shutdown_clone_snap = Arc::clone(&shutdown);
         let snapshotter_handle = std::thread::spawn(move || {
             while !shutdown_clone_snap.load(Ordering::Relaxed) {
-                let segment_idx = {
-                    let rx = rx_clone_snap.lock().expect("Snapshot queue mutex poisoned");
-                    match rx.try_recv() {
-                        Ok(idx) => idx,
-                        Err(mpsc::TryRecvError::Empty) => {
-                            std::thread::sleep(Duration::from_millis(50));
-                            continue;
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            eprintln!("Snapshotter: Snapshot queue disconnected, shutting down.");
-                            return;
-                        }
+                let segment_idx = match rx_clone_snap
+                    .lock()
+                    .expect("Snapshot queue mutex poisoned")
+                    .recv_timeout(Duration::from_millis(100))
+                {
+                    Ok(idx) => idx,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue, // Loop to check shutdown flag again
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // Sender has been dropped, so we can shut down.
+                        return;
                     }
                 };
 
                 let segment: &WalSegment = &segments_clone_snap[segment_idx];
 
                 {
-                    let state = segment.state.lock().expect("WalSegment state mutex poisoned");
+                    let (lock, _) = &*segment.state;
+                    let state = lock.lock().expect("WalSegment state mutex poisoned");
                     if *state != WalSegmentState::PendingSnapshot {
                         eprintln!(
                             "Snapshotter: Segment {} in unexpected state: {:?}",
@@ -323,7 +323,7 @@ where
                                             snapshot_data.data.insert(key, val);
                                         }
                                         None => {
-                                            snapshot_data.data.remove(&key);
+                                            snapshot_data.data.remove((&key).borrow());
                                         }
                                     }
                                 }
@@ -358,8 +358,15 @@ where
                 })();
 
                 if let Err(e) = write_result {
-                    eprintln!("Snapshotter: Failed to write or rename snapshot file {:?}: {}", snapshot_path_clone, e);
-                    let _ = fs::remove_file(&tmp_snapshot_path); // Clean up temp file
+                    // This is a critical failure. If we can't write snapshots, we can't
+                    // reclaim WAL space, and the system will eventually deadlock.
+                    // Panicking is the safest option to alert the operator and prevent
+                    // silent failure.
+                    let _ = fs::remove_file(&tmp_snapshot_path); // Attempt to clean up
+                    panic!(
+                        "FATAL: Snapshotter failed to write or rename snapshot file {:?}: {}. Shutting down to prevent data loss or deadlock.",
+                        snapshot_path_clone, e
+                    );
                 } else {
                     // Truncate the WAL file to mark it as free.
                     if let Ok(mut file) = segment.file.lock() {
@@ -374,11 +381,10 @@ where
                     }
 
                     // Mark the segment as Available again.
-                    if let Ok(mut state) = segment.state.lock() {
-                        *state = WalSegmentState::Available;
-                    } else {
-                        eprintln!("Snapshotter: Failed to lock WAL segment state for marking as available.");
-                    }
+                    let (lock, cvar) = &*segment.state;
+                    let mut state = lock.lock().unwrap();
+                    *state = WalSegmentState::Available;
+                    cvar.notify_one();
                 }
             }
         });
@@ -547,7 +553,7 @@ where
         }
 
         // 6. Commit the recovery transaction
-        tx_manager.commit(&tx)?;
+        tx_manager.commit(&tx, || Ok(()))?;
 
         Ok(skiplist)
     }
@@ -648,20 +654,18 @@ where
         let next_idx = (current_idx + 1) % wal_pool_size;
 
         // Block until the next segment is available.
-        loop {
-            let mut next_segment_state = self.wal_segments[next_idx].state.lock().unwrap();
-            if *next_segment_state == WalSegmentState::Available {
-                // It's available, we can proceed with the rotation.
-                *next_segment_state = WalSegmentState::Writing;
-                break;
-            }
-            // Drop the lock and wait before retrying.
-            drop(next_segment_state);
-            std::thread::sleep(Duration::from_millis(10)); // Sleep briefly
+        let (next_lock, next_cvar) = &*self.wal_segments[next_idx].state;
+        let mut state = next_lock.lock().unwrap();
+        while *state != WalSegmentState::Available {
+            state = next_cvar.wait(state).unwrap();
         }
+        // It's available, we can proceed with the rotation.
+        *state = WalSegmentState::Writing;
+        drop(state); // Explicitly drop the lock before moving on.
 
         // Mark the old segment as pending snapshot
-        *self.wal_segments[current_idx].state.lock().unwrap() = WalSegmentState::PendingSnapshot;
+        let (old_lock, _) = &*self.wal_segments[current_idx].state;
+        *old_lock.lock().unwrap() = WalSegmentState::PendingSnapshot;
 
         // Send the old segment to the snapshotter
         if let Err(e) = self.snapshot_queue_tx.send(current_idx) {

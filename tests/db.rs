@@ -450,3 +450,61 @@ async fn test_scan_induces_serialization_conflict() {
     let final_b = final_handle.get(&"b".to_string()).unwrap();
     assert_eq!(*final_b, 20); // from tx2
 }
+
+#[tokio::test]
+async fn test_phantom_read_prevention_for_range_scan() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+
+    let mut h1 = db.handle();
+    let mut h2 = db.handle();
+
+    // Tx1 starts and scans an empty range.
+    h1.begin().unwrap();
+    let range = h1.range(&"a".to_string(), &"c".to_string());
+    assert!(range.is_empty());
+
+    // Tx2 starts, INSERTS a key into that range, and commits.
+    h2.begin().unwrap();
+    h2.insert("b".to_string(), 100).await.unwrap();
+    let res2 = h2.commit().await;
+    assert!(res2.is_ok(), "Tx2 should commit successfully");
+
+    // Now, when Tx1 tries to commit, it should fail because Tx2 created a phantom.
+    let res1 = h1.commit().await;
+    assert!(res1.is_err(), "Tx1 should fail to commit");
+    assert_eq!(res1.unwrap_err(), FluxError::SerializationConflict);
+
+    // Check final state
+    let final_handle = db.handle();
+    let final_b = final_handle.get(&"b".to_string()).unwrap();
+    assert_eq!(*final_b, 100); // from tx2
+}
+
+#[tokio::test]
+async fn test_phantom_read_prevention_for_prefix_scan() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+
+    let mut h1 = db.handle();
+    let mut h2 = db.handle();
+
+    // Tx1 starts and scans an empty prefix.
+    h1.begin().unwrap();
+    let range = h1.prefix_scan("user:");
+    assert!(range.is_empty());
+
+    // Tx2 starts, INSERTS a key with that prefix, and commits.
+    h2.begin().unwrap();
+    h2.insert("user:jane".to_string(), 200).await.unwrap();
+    let res2 = h2.commit().await;
+    assert!(res2.is_ok(), "Tx2 should commit successfully");
+
+    // Now, when Tx1 tries to commit, it should fail because Tx2 created a phantom.
+    let res1 = h1.commit().await;
+    assert!(res1.is_err(), "Tx1 should fail to commit");
+    assert_eq!(res1.unwrap_err(), FluxError::SerializationConflict);
+
+    // Check final state
+    let final_handle = db.handle();
+    let final_b = final_handle.get(&"user:jane".to_string()).unwrap();
+    assert_eq!(*final_b, 200); // from tx2
+}

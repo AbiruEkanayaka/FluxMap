@@ -8,6 +8,7 @@ use crate::{mem::MemSize, SkipList};
 use crate::transaction::TransactionStatus;
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 impl<K, V> SkipList<K, V>
 where
@@ -111,6 +112,10 @@ where
                             )
                             .is_ok()
                         {
+                            let version_size = std::mem::size_of::<crate::VersionNode<Arc<V>>>()
+                                + version_node.version.value.mem_size();
+                            self.current_memory_bytes
+                                .fetch_sub(version_size as u64, Ordering::Relaxed);
                             unsafe {
                                 // SAFETY: `version_head` is a `Shared` pointer to a `VersionNode` that has been
                                 // successfully unlinked from the version chain via `compare_exchange`.
@@ -137,8 +142,27 @@ where
                 // and the node itself is not already marked for deletion,
                 // then the node can be logically marked for removal.
                 if !has_live_versions && !node.deleted.load(Ordering::Acquire) {
-                    node.deleted.store(true, Ordering::Release);
-                    keys_removed_count += 1;
+                    if node
+                        .deleted
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        keys_removed_count += 1;
+                        // The node is now logically deleted. We are responsible for decrementing
+                        // the memory counter for it and its entire version chain.
+                        let mut total_removed_size = std::mem::size_of::<crate::Node<K, V>>();
+                        if let Some(k) = &node.key {
+                            total_removed_size += k.mem_size();
+                        }
+                        let mut version_ptr = node.value.load(Ordering::Acquire, guard);
+                        while let Some(version_node) = unsafe { version_ptr.as_ref() } {
+                            total_removed_size += std::mem::size_of::<crate::VersionNode<Arc<V>>>();
+                            total_removed_size += version_node.version.value.mem_size();
+                            version_ptr = version_node.next.load(Ordering::Acquire, guard);
+                        }
+                        self.current_memory_bytes
+                            .fetch_sub(total_removed_size as u64, Ordering::Relaxed);
+                    }
                 }
             }
             current_node_ptr = node.next[0].load(Ordering::Relaxed, guard);

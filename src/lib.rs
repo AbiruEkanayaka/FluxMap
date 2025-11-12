@@ -444,6 +444,7 @@ where
     pub async fn insert(&self, key: K, value: Arc<V>, transaction: &Transaction<K, V>) {
         transaction.write_set.insert(key.clone());
         let new_level = self.random_level();
+        let mut attempts = 0;
 
         loop {
             let action = {
@@ -534,6 +535,7 @@ where
                         }
                     } else {
                         // Key does not exist, create a new node.
+                        transaction.insert_set.insert(key.clone());
                         let node_size = std::mem::size_of::<Node<K, V>>()
                             + std::mem::size_of::<VersionNode<Arc<V>>>()
                             + key.mem_size()
@@ -579,6 +581,7 @@ where
                     }
                 } else {
                     // List is empty or we are at the end. Create a new node.
+                    transaction.insert_set.insert(key.clone());
                     let node_size = std::mem::size_of::<Node<K, V>>()
                         + std::mem::size_of::<VersionNode<Arc<V>>>()
                         + key.mem_size()
@@ -616,21 +619,14 @@ where
 
             match action {
                 InsertAction::YieldAndRetry => {
-                    // Implement exponential backoff
-                    let mut attempts = 0;
-                    loop {
-                        attempts += 1;
-                        if attempts < 5 {
-                            // Spin for a few attempts
-                            std::thread::yield_now();
-                        } else {
-                            // Then yield to Tokio runtime with increasing delay
-                            let delay_ms = 2u64.pow(attempts - 5); // Exponential delay
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms.min(100)))
-                                .await; // Cap delay at 100ms
-                        }
-                        // Break from the inner loop to let the outer loop re-run the whole insert logic.
-                        break;
+                    attempts += 1;
+                    if attempts < 5 {
+                        // Yield for a few attempts before sleeping.
+                        tokio::task::yield_now().await;
+                    } else {
+                        // Then sleep with increasing delay.
+                        let delay_ms = 2u64.pow(attempts as u32 - 4).min(100); // Exponential delay, capped at 100ms
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
                     continue; // Continue the outer loop to retry the insert operation
                 }

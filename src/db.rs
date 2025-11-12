@@ -148,7 +148,8 @@ where
         + Eq
         + Serialize
         + for<'de> Deserialize<'de>
-        + MemSize,
+        + MemSize
+        + Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
 {
     /// Configures the database for full durability (`fsync` per transaction).
@@ -303,7 +304,8 @@ where
         + Eq
         + Serialize
         + DeserializeOwned
-        + MemSize,
+        + MemSize
+        + Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
     skiplist: Arc<SkipList<K, V>>,
@@ -327,7 +329,8 @@ where
         + Eq
         + Serialize
         + DeserializeOwned
-        + MemSize,
+        + MemSize
+        + Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
     fn drop(&mut self) {
@@ -351,7 +354,8 @@ where
         + Eq
         + Serialize
         + for<'de> Deserialize<'de>
-        + MemSize,
+        + MemSize
+        + Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
 {
     /// Checks if memory usage exceeds the configured limit and evicts keys until it's under the limit.
@@ -477,7 +481,8 @@ where
         + Eq
         + Serialize
         + DeserializeOwned
-        + MemSize,
+        + MemSize
+        + Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
     db: &'db Database<K, V>,
@@ -501,7 +506,8 @@ where
         + Eq
         + Serialize
         + DeserializeOwned
-        + MemSize,
+        + MemSize
+        + Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
     /// Ensures that any active transaction is rolled back when the handle is dropped.
@@ -524,7 +530,8 @@ where
         + Eq
         + Serialize
         + DeserializeOwned
-        + MemSize,
+        + MemSize
+        + Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
     /// Retrieves a value from the database.
@@ -557,7 +564,7 @@ where
             // --- Explicit Transaction Path ---
             // 1. Check workspace for writes made within this transaction (RYOW).
             let workspace = active_tx.workspace.read().unwrap();
-            if let Some(workspace_value) = workspace.get(key) {
+            if let Some(workspace_value) = workspace.get(key.borrow()) {
                 return workspace_value.clone();
             }
             // 2. Not in workspace, read from skiplist using the transaction's snapshot.
@@ -567,7 +574,7 @@ where
             let tx_manager = self.skiplist.transaction_manager();
             let tx = tx_manager.begin();
             let result = self.skiplist.get(key, &tx);
-            tx_manager.commit(&tx).unwrap(); // Autocommit always succeeds
+            tx_manager.commit(&tx, || Ok(())).unwrap(); // Autocommit for reads cannot fail.
             result
         }
     }
@@ -607,30 +614,37 @@ where
                 .write()
                 .unwrap()
                 .insert(key, Some(Arc::new(value)));
+            Ok(())
         } else {
             // --- Autocommit Path ---
             let tx_manager = self.skiplist.transaction_manager();
             let tx = tx_manager.begin();
 
-            // For durable autocommit, we must log the operation to the WAL.
-            if let Some(engine) = self.persistence_engine {
-                let mut workspace = crate::transaction::Workspace::new();
-                workspace.insert(key.clone(), Some(Arc::new(value.clone())));
-                let mut serialized_data = Vec::new();
-                ciborium::into_writer(&workspace, &mut serialized_data)
-                    .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
-                if let Err(e) = engine.log(&serialized_data) {
-                    tx_manager.abort(&tx);
-                    return Err(e.into());
-                }
-            }
+            // Provisionally apply the write.
+            self.skiplist.insert(key.clone(), Arc::new(value.clone()), &tx).await;
 
-            // In autocommit, we write directly to the skiplist's pending versions.
-            self.skiplist.insert(key, Arc::new(value), &tx).await;
-            tx_manager.commit(&tx)?;
-            self.db.evict_if_needed().await;
+            // Define the pre-commit hook for WAL logging.
+            let on_pre_commit = || {
+                if let Some(engine) = self.persistence_engine {
+                    let mut workspace = crate::transaction::Workspace::new();
+                    workspace.insert(key, Some(Arc::new(value)));
+                    let mut serialized_data = Vec::new();
+                    ciborium::into_writer(&workspace, &mut serialized_data)
+                        .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
+                    engine.log(&serialized_data)?;
+                }
+                Ok(())
+            };
+
+            // Attempt to commit with the WAL hook.
+            match tx_manager.commit(&tx, on_pre_commit) {
+                Ok(()) => {
+                    self.db.evict_if_needed().await;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
-        Ok(())
     }
 
     /// Removes a key from the database.
@@ -681,23 +695,29 @@ where
             let tx_manager = self.skiplist.transaction_manager();
             let tx = tx_manager.begin();
 
-            // For durable autocommit, we must log the operation to the WAL.
-            if let Some(engine) = self.persistence_engine {
-                let mut workspace: crate::transaction::Workspace<K, V> =
-                    crate::transaction::Workspace::new();
-                workspace.insert(key.clone(), None); // None signifies removal
-                let mut serialized_data = Vec::new();
-                ciborium::into_writer(&workspace, &mut serialized_data)
-                    .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
-                if let Err(e) = engine.log(&serialized_data) {
-                    tx_manager.abort(&tx);
-                    return Err(e.into());
-                }
-            }
-
+            // Provisionally apply the remove.
             let result = self.skiplist.remove(key, &tx).await;
-            tx_manager.commit(&tx)?;
-            Ok(result)
+
+            // Define the pre-commit hook for WAL logging.
+            let key_clone = key.clone();
+            let on_pre_commit = || {
+                if let Some(engine) = self.persistence_engine {
+                    let mut workspace: crate::transaction::Workspace<K, V> =
+                        crate::transaction::Workspace::new();
+                    workspace.insert(key_clone, None); // None signifies removal
+                    let mut serialized_data = Vec::new();
+                    ciborium::into_writer(&workspace, &mut serialized_data)
+                        .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
+                    engine.log(&serialized_data)?;
+                }
+                Ok(())
+            };
+
+            // Attempt to commit with the WAL hook.
+            match tx_manager.commit(&tx, on_pre_commit) {
+                Ok(()) => Ok(result),
+                Err(e) => Err(e),
+            }
         }
     }
 
@@ -733,8 +753,11 @@ where
     pub fn range(&self, start: &K, end: &K) -> Vec<(K, Arc<V>)> {
         if let Some(active_tx) = &self.active_tx {
             // --- Explicit Transaction Path with RYOW ---
-            // TODO: Implement full range-locking to prevent phantom reads for true SSI.
-            // For now, we record every key we read, which prevents some but not all anomalies.
+            active_tx
+                .range_scans
+                .write()
+                .unwrap()
+                .push((start.clone(), end.clone()));
 
             // 1. Get results from the persistent skiplist.
             let mut results: BTreeMap<K, Arc<V>> = self
@@ -754,7 +777,7 @@ where
                         }
                         None => {
                             // Deletion from workspace
-                            results.remove(key);
+                            results.remove(key.borrow());
                         }
                     }
                 }
@@ -765,7 +788,7 @@ where
             let tx_manager = self.skiplist.transaction_manager();
             let tx = tx_manager.begin();
             let results = self.skiplist.range(start, end, &tx);
-            tx_manager.commit(&tx).unwrap(); // Autocommit always succeeds
+            tx_manager.commit(&tx, || Ok(())).unwrap(); // Autocommit for reads cannot fail.
             results
         }
     }
@@ -802,7 +825,7 @@ where
                 while let Some(item) = stream.next().await {
                     yield item;
                 }
-                tx_manager.commit(&tx).unwrap();
+                tx_manager.commit(&tx, || Ok(())).unwrap();
             }
         }
     }
@@ -836,44 +859,41 @@ where
             .take()
             .ok_or(FluxError::NoActiveTransaction)?;
 
-        // --- Phase 1: Persistence (if durable) ---
-        // Log the transaction's workspace to the WAL *before* applying changes to the
-        // in-memory skiplist. This ensures that if we crash after this point, recovery
-        // can replay the transaction.
-        if let Some(engine) = self.persistence_engine {
-            let workspace = active_tx.workspace.read().unwrap();
-            if !workspace.is_empty() {
-                let mut serialized_data = Vec::new();
-                ciborium::into_writer(&*workspace, &mut serialized_data)
-                    .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
-
-                if let Err(e) = engine.log(&serialized_data) {
-                    // If logging fails, we must abort the transaction.
-                    let tx_manager = self.skiplist.transaction_manager();
-                    tx_manager.abort(&active_tx);
-                    return Err(e.into());
-                }
-            }
-        }
-
-        // --- Phase 2: In-Memory Application ---
+        // --- Phase 1: In-Memory Application ---
         // Apply changes from the workspace to the actual skiplist.
-        let workspace = std::mem::take(&mut *active_tx.workspace.write().unwrap());
-        for (key, value) in workspace {
+        // This is provisional; the versions are not visible until the transaction status is Committed.
+        let workspace = active_tx.workspace.read().unwrap();
+        for (key, value) in workspace.iter() {
             match value {
                 Some(val) => {
-                    self.skiplist.insert(key, val, &active_tx).await;
+                    self.skiplist.insert(key.clone(), val.clone(), &active_tx).await;
                 }
                 None => {
-                    self.skiplist.remove(&key, &active_tx).await;
+                    self.skiplist.remove(key, &active_tx).await;
                 }
             }
         }
 
-        // --- Phase 3: Finalize Commit ---
-        // Attempt to commit via the transaction manager, which performs SSI checks.
+        // --- Phase 2: Finalize Commit (with WAL write hook) ---
+        // The WAL write is wrapped in a closure and passed to the transaction manager.
+        // It will only be executed if the SSI checks pass.
         let tx_manager = self.skiplist.transaction_manager();
-        match tx_manager.commit(&active_tx) {
+        let persistence_engine = self.persistence_engine;
+
+        let on_pre_commit = || {
+            if let Some(engine) = persistence_engine {
+                if !workspace.is_empty() {
+                    let mut serialized_data = Vec::new();
+                    ciborium::into_writer(&*workspace, &mut serialized_data)
+                        .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
+
+                    engine.log(&serialized_data)?;
+                }
+            }
+            Ok(())
+        };
+
+        match tx_manager.commit(&active_tx, on_pre_commit) {
             Ok(()) => {
                 self.db.evict_if_needed().await;
                 Ok(())
@@ -986,6 +1006,12 @@ where
     pub fn prefix_scan(&self, prefix: &str) -> Vec<(K, Arc<V>)> {
         if let Some(active_tx) = &self.active_tx {
             // --- Explicit Transaction Path with RYOW ---
+            active_tx
+                .prefix_scans
+                .write()
+                .unwrap()
+                .push(prefix.to_string());
+
             // 1. Get results from the persistent skiplist.
             let mut results: BTreeMap<K, Arc<V>> = self
                 .skiplist
@@ -1015,7 +1041,7 @@ where
             let tx_manager = self.skiplist.transaction_manager();
             let tx = tx_manager.begin();
             let results = self.skiplist.prefix_scan(prefix, &tx);
-            tx_manager.commit(&tx).unwrap();
+            tx_manager.commit(&tx, || Ok(())).unwrap();
             results
         }
     }
@@ -1050,7 +1076,7 @@ where
                 while let Some(item) = stream.next().await {
                     yield item;
                 }
-                tx_manager.commit(&tx).unwrap();
+                tx_manager.commit(&tx, || Ok(())).unwrap();
             }
         }
     }
