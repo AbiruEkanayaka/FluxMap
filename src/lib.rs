@@ -24,7 +24,7 @@ use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
 use crossbeam_utils::CachePadded;
 use dashmap::DashSet;
 use futures::stream::Stream;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub mod db;
 pub mod error;
@@ -32,7 +32,7 @@ pub mod mem;
 pub mod persistence;
 pub mod transaction;
 pub mod vacuum;
-pub use crate::mem::MemSize;
+use crate::mem::{EvictionPolicy, MemSize};
 pub use crate::transaction::{Snapshot, Transaction, TransactionManager, TxId, Version};
 pub use persistence::{DurabilityLevel, PersistenceEngine, PersistenceOptions};
 
@@ -65,6 +65,8 @@ struct Node<K, V> {
     deleted: AtomicBool,
     /// A timestamp indicating the last time this node was accessed, for LRU eviction.
     last_accessed: AtomicU64,
+    /// The number of times this node has been accessed, for LFU eviction.
+    access_count: AtomicU64,
 }
 
 impl<K, V> Node<K, V> {
@@ -76,6 +78,7 @@ impl<K, V> Node<K, V> {
             next: (0..max_level).map(|_| Atomic::null()).collect(),
             deleted: AtomicBool::new(false),
             last_accessed: AtomicU64::new(0),
+            access_count: AtomicU64::new(0),
         })
     }
 
@@ -94,6 +97,7 @@ impl<K, V> Node<K, V> {
             next: (0..level + 1).map(|_| Atomic::null()).collect(),
             deleted: AtomicBool::new(false),
             last_accessed: AtomicU64::new(access_time),
+            access_count: AtomicU64::new(1),
         })
     }
 }
@@ -134,10 +138,7 @@ where
     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
 {
     /// Creates a new, empty `SkipList` with the default max level.
-    pub fn new(
-        current_memory_bytes: Arc<AtomicU64>,
-        access_clock: Arc<AtomicU64>,
-    ) -> Self {
+    pub fn new(current_memory_bytes: Arc<AtomicU64>, access_clock: Arc<AtomicU64>) -> Self {
         Self::with_max_level(DEFAULT_MAX_LEVEL, current_memory_bytes, access_clock)
     }
 
@@ -346,11 +347,12 @@ where
             } == key
                 && !node.deleted.load(Ordering::Acquire)
             {
-                // Update the LRU timestamp for this node since it's being accessed.
+                // Update the LRU timestamp and LFU counter for this node since it's being accessed.
                 node.last_accessed.store(
                     self.access_clock.fetch_add(1, Ordering::Relaxed),
                     Ordering::Relaxed,
                 );
+                node.access_count.fetch_add(1, Ordering::Relaxed);
 
                 let mut current_version_ptr = node.value.load(Ordering::Acquire, guard);
                 while let Some(version_node) = unsafe {
@@ -472,9 +474,12 @@ where
                         // An update must be treated as a read followed by a write to ensure
                         // serializability. We must find the visible version and add it to our
                         // read set to detect write-skew anomalies.
-                        let mut current_version_ptr = next_node.value.load(Ordering::Acquire, guard);
+                        let mut current_version_ptr =
+                            next_node.value.load(Ordering::Acquire, guard);
                         while let Some(version_node) = unsafe { current_version_ptr.as_ref() } {
-                            let is_visible = transaction.snapshot.is_visible(&version_node.version, &*self.tx_manager);
+                            let is_visible = transaction
+                                .snapshot
+                                .is_visible(&version_node.version, &*self.tx_manager);
                             if is_visible {
                                 // Found the visible version. Record the read for SSI.
                                 transaction
@@ -491,10 +496,12 @@ where
                         }
 
                         // Now, prepend a new version to the version chain.
+                        // This counts as an access for eviction policies.
                         next_node.last_accessed.store(
                             self.access_clock.fetch_add(1, Ordering::Relaxed),
                             Ordering::Relaxed,
                         );
+                        next_node.access_count.fetch_add(1, Ordering::Relaxed);
 
                         let new_version = Version {
                             value: value.clone(),
@@ -537,14 +544,20 @@ where
                         // Key does not exist, create a new node.
                         transaction.insert_set.insert(key.clone());
                         let node_size = std::mem::size_of::<Node<K, V>>()
+                            + ((new_level + 1) * std::mem::size_of::<Atomic<Node<K, V>>>())
                             + std::mem::size_of::<VersionNode<Arc<V>>>()
                             + key.mem_size()
                             + value.mem_size();
                         self.current_memory_bytes
                             .fetch_add(node_size as u64, Ordering::Relaxed);
 
-                        let new_node =
-                            Node::new(key.clone(), value.clone(), new_level, transaction.id, self.access_clock.fetch_add(1, Ordering::Relaxed));
+                        let new_node = Node::new(
+                            key.clone(),
+                            value.clone(),
+                            new_level,
+                            transaction.id,
+                            self.access_clock.fetch_add(1, Ordering::Relaxed),
+                        );
                         let new_node_shared = new_node.into_shared(guard);
 
                         unsafe {
@@ -583,13 +596,20 @@ where
                     // List is empty or we are at the end. Create a new node.
                     transaction.insert_set.insert(key.clone());
                     let node_size = std::mem::size_of::<Node<K, V>>()
+                        + ((new_level + 1) * std::mem::size_of::<Atomic<Node<K, V>>>())
                         + std::mem::size_of::<VersionNode<Arc<V>>>()
                         + key.mem_size()
                         + value.mem_size();
                     self.current_memory_bytes
                         .fetch_add(node_size as u64, Ordering::Relaxed);
 
-                    let new_node = Node::new(key.clone(), value.clone(), new_level, transaction.id, self.access_clock.fetch_add(1, Ordering::Relaxed));
+                    let new_node = Node::new(
+                        key.clone(),
+                        value.clone(),
+                        new_level,
+                        transaction.id,
+                        self.access_clock.fetch_add(1, Ordering::Relaxed),
+                    );
                     let new_node_shared = new_node.into_shared(guard);
 
                     unsafe {
@@ -633,6 +653,65 @@ where
                 InsertAction::Return => return,
             }
         }
+    }
+
+    /// Dispatches to the appropriate victim-finding strategy based on the policy.
+    pub fn find_victim_key(&self, policy: EvictionPolicy) -> Option<K> {
+        match policy {
+            EvictionPolicy::Lru => self.find_lru_victim_key(),
+            EvictionPolicy::Lfu => self.find_lfu_victim_key(),
+        }
+    }
+
+    /// Finds a potential victim key for eviction using a random sampling LFU strategy.
+    ///
+    /// Tie-breaking is done by LRU.
+    pub fn find_lfu_victim_key(&self) -> Option<K> {
+        const SAMPLE_SIZE: usize = 20;
+        let guard = &crossbeam_epoch::pin();
+
+        let mut samples = Vec::with_capacity(SAMPLE_SIZE);
+        let mut current = self.head.load(Ordering::Relaxed, guard);
+
+        // Skip the head node
+        current = unsafe { current.deref().next[0].load(Ordering::Relaxed, guard) };
+
+        // Reservoir sampling to get a random set of nodes
+        let mut i = 0;
+        while let Some(node_ref) = unsafe { current.as_ref() } {
+            if node_ref.key.is_some() && !node_ref.deleted.load(Ordering::Acquire) {
+                if i < SAMPLE_SIZE {
+                    samples.push(current);
+                } else {
+                    let j = fastrand::usize(..=i);
+                    if j < SAMPLE_SIZE {
+                        samples[j] = current;
+                    }
+                }
+                i += 1;
+            }
+            current = node_ref.next[0].load(Ordering::Relaxed, guard);
+        }
+
+        if samples.is_empty() {
+            return None;
+        }
+
+        // Find the node with the lowest access count, using LRU as a tie-breaker.
+        let lfu_node_shared = samples
+            .iter()
+            .min_by_key(|&&node_ptr| {
+                let node = unsafe { node_ptr.as_ref().unwrap() };
+                // Tuple of (count, timestamp) for tie-breaking
+                (
+                    node.access_count.load(Ordering::Relaxed),
+                    node.last_accessed.load(Ordering::Relaxed),
+                )
+            })
+            .unwrap(); // Safe to unwrap as samples is not empty
+
+        let lfu_node = unsafe { lfu_node_shared.as_ref().unwrap() };
+        lfu_node.key.clone()
     }
 
     /// Finds a potential victim key for eviction using a random sampling LRU strategy.
@@ -699,7 +778,8 @@ where
                 }
 
                 // Calculate the size of the node and all its versions.
-                let mut total_removed_size = std::mem::size_of::<Node<K, V>>();
+                let mut total_removed_size = std::mem::size_of::<Node<K, V>>()
+                    + (node.next.len() * std::mem::size_of::<Atomic<Node<K, V>>>());
                 if let Some(k) = &node.key {
                     total_removed_size += k.mem_size();
                 }
@@ -815,8 +895,7 @@ where
         let mut results = Vec::new();
 
         let predecessor = self.find_optimistic_predecessor::<K>(start, guard);
-        let mut current =
-            unsafe { predecessor.deref().next[0].load(Ordering::Acquire, guard) };
+        let mut current = unsafe { predecessor.deref().next[0].load(Ordering::Acquire, guard) };
 
         loop {
             if let Some(node_ref) = unsafe { current.as_ref() } {
@@ -955,8 +1034,7 @@ where
         let mut results = Vec::new();
 
         let predecessor = self.find_optimistic_predecessor::<str>(prefix, guard);
-        let mut current =
-            unsafe { predecessor.deref().next[0].load(Ordering::Acquire, guard) };
+        let mut current = unsafe { predecessor.deref().next[0].load(Ordering::Acquire, guard) };
 
         loop {
             if let Some(node_ref) = unsafe { current.as_ref() } {

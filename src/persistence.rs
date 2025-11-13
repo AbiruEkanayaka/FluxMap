@@ -22,11 +22,11 @@
 //!     replays any subsequent WAL segments to restore the database to its last known
 //!     consistent state.
 
-use crate::mem::MemSize;
 use crate::SkipList;
+use crate::mem::MemSize;
 use crate::transaction::Workspace;
-use rustix::fs::fallocate;
 use rustix::fs::FallocateFlags;
+use rustix::fs::fallocate;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -34,8 +34,9 @@ use std::io::{self, BufReader, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::{
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    mpsc, Arc, Condvar, Mutex,
+    mpsc,
 };
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -328,17 +329,25 @@ where
                                     }
                                 }
                             }
-                            Err(ciborium::de::Error::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                            Err(ciborium::de::Error::Io(ref e))
+                                if e.kind() == io::ErrorKind::UnexpectedEof =>
+                            {
                                 break; // Reached end of file
                             }
                             Err(e) => {
-                                eprintln!("Snapshotter: Failed to deserialize workspace from WAL segment {:?}: {}", wal_file_path, e);
+                                eprintln!(
+                                    "Snapshotter: Failed to deserialize workspace from WAL segment {:?}: {}",
+                                    wal_file_path, e
+                                );
                                 break; // Stop processing this WAL segment
                             }
                         }
                     }
                 } else {
-                    eprintln!("Snapshotter: Failed to open WAL segment file {:?}.", wal_file_path);
+                    eprintln!(
+                        "Snapshotter: Failed to open WAL segment file {:?}.",
+                        wal_file_path
+                    );
                 }
 
                 snapshot_data.last_processed_segment_idx = Some(segment_idx);
@@ -346,11 +355,12 @@ where
 
                 let write_result = (|| {
                     let tmp_file = File::create(&tmp_snapshot_path)?;
-                    ciborium::into_writer(&snapshot_data, tmp_file)
-                        .map_err(|e| match e {
-                            ciborium::ser::Error::Io(io_err) => io_err,
-                            ciborium::ser::Error::Value(msg) => io::Error::new(io::ErrorKind::InvalidData, msg),
-                        })?;
+                    ciborium::into_writer(&snapshot_data, tmp_file).map_err(|e| match e {
+                        ciborium::ser::Error::Io(io_err) => io_err,
+                        ciborium::ser::Error::Value(msg) => {
+                            io::Error::new(io::ErrorKind::InvalidData, msg)
+                        }
+                    })?;
                     let file_to_sync = File::open(&tmp_snapshot_path)?;
                     file_to_sync.sync_all()?;
                     fs::rename(&tmp_snapshot_path, &snapshot_path_clone)?;
@@ -371,13 +381,22 @@ where
                     // Truncate the WAL file to mark it as free.
                     if let Ok(mut file) = segment.file.lock() {
                         if let Err(e) = file.set_len(0) {
-                            eprintln!("Snapshotter: Failed to truncate WAL segment file {}: {}", segment_idx, e);
+                            eprintln!(
+                                "Snapshotter: Failed to truncate WAL segment file {}: {}",
+                                segment_idx, e
+                            );
                         }
                         if let Err(e) = file.seek(SeekFrom::Start(0)) {
-                            eprintln!("Snapshotter: Failed to seek WAL segment file {}: {}", segment_idx, e);
+                            eprintln!(
+                                "Snapshotter: Failed to seek WAL segment file {}: {}",
+                                segment_idx, e
+                            );
                         }
                     } else {
-                        eprintln!("Snapshotter: Failed to lock WAL segment file {} for truncation.", segment_idx);
+                        eprintln!(
+                            "Snapshotter: Failed to lock WAL segment file {} for truncation.",
+                            segment_idx
+                        );
                     }
 
                     // Mark the segment as Available again.
@@ -390,7 +409,10 @@ where
         });
 
         // --- Flusher Thread (only for Relaxed mode) ---
-        let flusher_handle = if let DurabilityLevel::Relaxed { flush_interval_ms, .. } = config {
+        let flusher_handle = if let DurabilityLevel::Relaxed {
+            flush_interval_ms, ..
+        } = config
+        {
             let segments_clone_flush = wal_segments.clone();
             let current_idx_clone_flush = Arc::clone(&current_segment_idx);
             let shutdown_clone_flush = Arc::clone(&shutdown);
@@ -399,7 +421,7 @@ where
             let bytes_clone = Arc::clone(&bytes_since_flush);
 
             Some(std::thread::spawn(move || {
-                 let runtime = tokio::runtime::Builder::new_current_thread()
+                let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap();
@@ -681,7 +703,7 @@ where
         // Reset writer position and update current segment index
         self.writer_position.store(0, Ordering::Relaxed);
         self.current_segment_idx.store(next_idx, Ordering::Relaxed);
-        
+
         // Also reset the flush counters as rotation implies a flush of the old segment
         self.commits_since_flush.store(0, Ordering::Relaxed);
         self.bytes_since_flush.store(0, Ordering::Relaxed);

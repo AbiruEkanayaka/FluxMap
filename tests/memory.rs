@@ -1,5 +1,5 @@
 use fluxmap::db::Database;
-use fluxmap::mem::MemSize;
+use fluxmap::mem::{EvictionPolicy, MemSize};
 use std::sync::Arc;
 
 // A simple struct to test MemSize implementation.
@@ -14,6 +14,7 @@ impl MemSize for TestVal {
 
 #[tokio::test]
 async fn test_eviction_on_memory_limit() {
+    fastrand::seed(0);
     // Set a very small memory limit to trigger eviction easily.
     // Let's estimate the size of one entry:
     // Node<String, i32>: ~64 bytes (depends on arch)
@@ -22,13 +23,8 @@ async fn test_eviction_on_memory_limit() {
     // i32 value: 4 bytes
     // Total is roughly 120 bytes.
     // Let's set a limit of 300 bytes, which should allow 2 keys but not 3.
-    let db: Arc<Database<String, i32>> = Arc::new(
-        Database::builder()
-            .max_memory(300)
-            .build()
-            .await
-            .unwrap(),
-    );
+    let db: Arc<Database<String, i32>> =
+        Arc::new(Database::builder().max_memory(450).build().await.unwrap());
 
     let handle = db.handle();
 
@@ -78,5 +74,59 @@ async fn test_eviction_on_memory_limit() {
     assert!(
         handle.get(&"key4".to_string()).is_some(),
         "key4 should exist"
+    );
+}
+
+#[tokio::test]
+async fn test_eviction_on_memory_limit_lfu() {
+    fastrand::seed(0);
+    // Set a very small memory limit to trigger eviction easily.
+    let db: Arc<Database<String, i32>> = Arc::new(
+        Database::builder()
+            .max_memory(450) // Allows ~2 keys
+            .eviction_policy(EvictionPolicy::Lfu)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let handle = db.handle();
+
+    handle.insert("key_frequent".to_string(), 1).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    handle
+        .insert("key_infrequent".to_string(), 2)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    // Make key_frequent very frequent
+    for _ in 0..5 {
+        let _ = handle.get(&"key_frequent".to_string());
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    // At this point, access counts should be:
+    // - key_frequent: 6 (1 from insert, 5 from gets)
+    // - key_infrequent: 1 (from insert)
+
+    // This insert will trigger eviction.
+    handle.insert("key_new".to_string(), 3).await.unwrap();
+
+    // A new key "key_new" is now present with count 1.
+    // The eviction logic should run and choose a victim from the three keys.
+    // The LFU victim is "key_infrequent" because it has the lowest access count (1)
+    // and is the oldest among the keys with that count.
+
+    assert!(
+        handle.get(&"key_infrequent".to_string()).is_none(),
+        "key_infrequent should have been evicted"
+    );
+    assert!(
+        handle.get(&"key_frequent".to_string()).is_some(),
+        "key_frequent should still exist"
+    );
+    assert!(
+        handle.get(&"key_new".to_string()).is_some(),
+        "key_new should exist"
     );
 }

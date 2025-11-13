@@ -1,6 +1,6 @@
-use fluxmap::{error, SkipList};
-use futures::pin_mut;
+use fluxmap::{SkipList, error};
 use futures::StreamExt;
+use futures::pin_mut;
 use rand::{Rng, SeedableRng};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;

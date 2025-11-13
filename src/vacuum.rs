@@ -4,11 +4,12 @@
 //! that are no longer visible to any active or future transaction. This prevents
 //! unbounded memory growth in workloads with frequent updates or deletes.
 
-use crate::{mem::MemSize, SkipList};
 use crate::transaction::TransactionStatus;
-use serde::{de::DeserializeOwned, Serialize};
-use std::sync::atomic::Ordering;
+use crate::{SkipList, mem::MemSize};
+use crossbeam_epoch::Atomic;
+use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 impl<K, V> SkipList<K, V>
 where
@@ -150,7 +151,8 @@ where
                         keys_removed_count += 1;
                         // The node is now logically deleted. We are responsible for decrementing
                         // the memory counter for it and its entire version chain.
-                        let mut total_removed_size = std::mem::size_of::<crate::Node<K, V>>();
+                        let mut total_removed_size = std::mem::size_of::<crate::Node<K, V>>()
+                            + (node.next.len() * std::mem::size_of::<Atomic<crate::Node<K, V>>>());
                         if let Some(k) = &node.key {
                             total_removed_size += k.mem_size();
                         }

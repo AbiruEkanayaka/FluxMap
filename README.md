@@ -235,6 +235,7 @@ async fn main() {
     let db: Arc<Database<String, String>> = Arc::new(
         Database::builder()
             .max_memory(500)
+            // You can also choose .eviction_policy(fluxmap::mem::EvictionPolicy::Lfu)
             .build()
             .await
             .unwrap(),
@@ -294,6 +295,7 @@ let db = Database::<String, String>::builder()
         interval: Duration::from_secs(30), // Run vacuum every 30 seconds
     })
     .max_memory(512 * 1024 * 1024) // Set a 512MB memory limit
+    .eviction_policy(fluxmap::mem::EvictionPolicy::Lfu) // Choose LFU eviction
     .build()
     .await
     .unwrap();
@@ -328,7 +330,10 @@ When configured via `auto_vacuum` on the builder, the database will spawn a back
 
 ### Memory Limiting and Eviction
 
-You can configure a memory limit to prevent the database from growing indefinitely. When the estimated memory usage exceeds this limit, FluxMap will automatically evict the least recently used (LRU) keys to stay under the limit.
+You can configure a memory limit to prevent the database from growing indefinitely. When the estimated memory usage exceeds this limit, FluxMap will automatically evict keys to stay under the limit based on the configured `EvictionPolicy`.
+
+-   **`Lru` (default):** Evicts the Least Recently Used item. This is a good general-purpose policy.
+-   **`Lfu`:** Evicts the Least Frequently Used item. This is useful for workloads where a subset of items is accessed much more frequently than the rest.
 
 To use this feature, your key and value types must implement the `fluxmap::mem::MemSize` trait, which helps the database estimate how much memory each entry consumes.
 

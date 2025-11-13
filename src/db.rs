@@ -58,20 +58,20 @@
 //! # }
 //! ```
 
+use crate::SkipList;
 use crate::error::{FluxError, PersistenceError};
-use crate::mem::MemSize;
+use crate::mem::{EvictionPolicy, MemSize};
 use crate::persistence::{DurabilityLevel, PersistenceEngine, PersistenceOptions};
 use crate::transaction::Transaction;
-use crate::SkipList;
 use futures::stream::StreamExt;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -119,6 +119,7 @@ pub struct DatabaseBuilder<K, V> {
     flush_after_n_commits: Option<usize>,
     flush_after_m_bytes: Option<u64>,
     max_memory_bytes: Option<u64>,
+    eviction_policy: EvictionPolicy,
     _phantom: PhantomData<(K, V)>,
 }
 
@@ -132,6 +133,7 @@ impl<K, V> Default for DatabaseBuilder<K, V> {
             flush_after_n_commits: None,
             flush_after_m_bytes: None,
             max_memory_bytes: None,
+            eviction_policy: EvictionPolicy::default(),
             _phantom: PhantomData,
         }
     }
@@ -198,9 +200,17 @@ where
     /// Sets a memory limit for the database.
     ///
     /// When the estimated memory usage exceeds this limit, the database will
-    /// begin evicting the least recently used (LRU) keys to stay under the limit.
+    /// begin evicting keys to stay under the limit.
     pub fn max_memory(mut self, bytes: u64) -> Self {
         self.max_memory_bytes = Some(bytes);
+        self
+    }
+
+    /// Sets the memory eviction policy.
+    ///
+    /// Defaults to `EvictionPolicy::Lru`.
+    pub fn eviction_policy(mut self, policy: EvictionPolicy) -> Self {
+        self.eviction_policy = policy;
         self
     }
 
@@ -229,8 +239,7 @@ where
             None => DurabilityLevel::InMemory,
         };
 
-        let persistence_engine = PersistenceEngine::new(durability)?
-            .map(Arc::new);
+        let persistence_engine = PersistenceEngine::new(durability)?.map(Arc::new);
 
         let current_memory_bytes = Arc::new(AtomicU64::new(0));
         let access_clock = Arc::new(AtomicU64::new(0));
@@ -282,6 +291,7 @@ where
             shutdown,
             max_memory_bytes: self.max_memory_bytes,
             current_memory_bytes,
+            eviction_policy: self.eviction_policy,
         })
     }
 }
@@ -308,6 +318,9 @@ where
         + Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
+    #[cfg(test)]
+    pub skiplist: Arc<SkipList<K, V>>,
+    #[cfg(not(test))]
     skiplist: Arc<SkipList<K, V>>,
     persistence_engine: Option<Arc<PersistenceEngine<K, V>>>,
     _vacuum_handle: Option<JoinHandle<()>>,
@@ -316,6 +329,8 @@ where
     max_memory_bytes: Option<u64>,
     /// An atomic counter for the estimated current memory usage.
     current_memory_bytes: Arc<AtomicU64>,
+    /// The configured memory eviction policy.
+    eviction_policy: EvictionPolicy,
 }
 
 impl<K, V> Drop for Database<K, V>
@@ -370,9 +385,9 @@ where
         }
     }
 
-    /// Finds and evicts a single LRU victim.
+    /// Finds and evicts a single victim based on the configured eviction policy.
     async fn evict_one(&self) -> Result<(), FluxError> {
-        if let Some(victim_key) = self.skiplist.find_lru_victim_key() {
+        if let Some(victim_key) = self.skiplist.find_victim_key(self.eviction_policy) {
             // The eviction in the skiplist is synchronous and updates the counter.
             // We don't need to do anything with a transaction here, as the eviction
             // is a low-level administrative task that marks the node as dead.
@@ -621,7 +636,9 @@ where
             let tx = tx_manager.begin();
 
             // Provisionally apply the write.
-            self.skiplist.insert(key.clone(), Arc::new(value.clone()), &tx).await;
+            self.skiplist
+                .insert(key.clone(), Arc::new(value.clone()), &tx)
+                .await;
 
             // Define the pre-commit hook for WAL logging.
             let on_pre_commit = || {
@@ -629,8 +646,9 @@ where
                     let mut workspace = crate::transaction::Workspace::new();
                     workspace.insert(key, Some(Arc::new(value)));
                     let mut serialized_data = Vec::new();
-                    ciborium::into_writer(&workspace, &mut serialized_data)
-                        .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
+                    ciborium::into_writer(&workspace, &mut serialized_data).map_err(|e| {
+                        FluxError::Persistence(PersistenceError::Serialization(e.to_string()))
+                    })?;
                     engine.log(&serialized_data)?;
                 }
                 Ok(())
@@ -706,8 +724,9 @@ where
                         crate::transaction::Workspace::new();
                     workspace.insert(key_clone, None); // None signifies removal
                     let mut serialized_data = Vec::new();
-                    ciborium::into_writer(&workspace, &mut serialized_data)
-                        .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
+                    ciborium::into_writer(&workspace, &mut serialized_data).map_err(|e| {
+                        FluxError::Persistence(PersistenceError::Serialization(e.to_string()))
+                    })?;
                     engine.log(&serialized_data)?;
                 }
                 Ok(())
@@ -866,7 +885,9 @@ where
         for (key, value) in workspace.iter() {
             match value {
                 Some(val) => {
-                    self.skiplist.insert(key.clone(), val.clone(), &active_tx).await;
+                    self.skiplist
+                        .insert(key.clone(), val.clone(), &active_tx)
+                        .await;
                 }
                 None => {
                     self.skiplist.remove(key, &active_tx).await;
@@ -884,8 +905,9 @@ where
             if let Some(engine) = persistence_engine {
                 if !workspace.is_empty() {
                     let mut serialized_data = Vec::new();
-                    ciborium::into_writer(&workspace, &mut serialized_data)
-                        .map_err(|e| FluxError::Persistence(PersistenceError::Serialization(e.to_string())))?;
+                    ciborium::into_writer(&workspace, &mut serialized_data).map_err(|e| {
+                        FluxError::Persistence(PersistenceError::Serialization(e.to_string()))
+                    })?;
 
                     engine.log(&serialized_data)?;
                 }
@@ -1065,5 +1087,3 @@ where
         }
     }
 }
-
-

@@ -32,10 +32,7 @@ async fn test_autocommit_remove() {
     assert!(val.is_some());
 
     let removed_val = handle.remove(&"key1".to_string()).await.unwrap();
-    assert_eq!(
-        removed_val.as_deref().map(|s| s.as_str()),
-        Some("value1")
-    );
+    assert_eq!(removed_val.as_deref().map(|s| s.as_str()), Some("value1"));
 
     let val_after_remove = handle.get(&"key1".to_string());
     assert!(val_after_remove.is_none());
@@ -359,7 +356,7 @@ async fn test_recovery_on_startup() {
         handle.insert("key1".to_string(), 1).await.unwrap();
         handle.insert("key2".to_string(), 2).await.unwrap();
         handle.commit().await.unwrap(); // Ensure data is committed
-                                        // DB is dropped here, simulating a shutdown
+        // DB is dropped here, simulating a shutdown
     }
 
     // --- Second Session ---

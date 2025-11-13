@@ -2,6 +2,17 @@
 
 use std::sync::Arc;
 
+/// The memory eviction policy to use when the database reaches its memory limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EvictionPolicy {
+    /// Evicts the least recently used (LRU) items. Good for general-purpose workloads.
+    #[default]
+    Lru,
+    /// Evicts the least frequently used (LFU) items. Good for workloads where some
+    /// items are accessed much more frequently than others.
+    Lfu,
+}
+
 /// A trait for types to report their memory usage, including heap-allocated data.
 ///
 /// This is crucial for the database's memory limiting and eviction functionality.
