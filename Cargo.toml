@@ -1,6 +1,6 @@
 [package]
 name = "fluxmap"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 authors = ["Abiru Ekanayaka <abiruekanayaka5@gmail.com>"]
 description = "A thread-safe, transactional, and concurrent in-memory key-value store for Rust. Offers ACID guarantees with Serializable Snapshot Isolation (SSI) and optional durability via a Write-Ahead Log (WAL). Designed for ease of use, high performance, and modern async Rust."
