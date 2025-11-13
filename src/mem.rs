@@ -11,6 +11,10 @@ pub enum EvictionPolicy {
     /// Evicts the least frequently used (LFU) items. Good for workloads where some
     /// items are accessed much more frequently than others.
     Lfu,
+    /// Evicts a random item. Good for workloads where access patterns are unpredictable.
+    Random,
+    /// Adaptive Replacement Cache. Provides a good balance between LRU and LFU.
+    Arc,
 }
 
 /// A trait for types to report their memory usage, including heap-allocated data.

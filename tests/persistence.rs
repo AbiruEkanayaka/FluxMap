@@ -2,6 +2,7 @@ use fluxmap::persistence::{DurabilityLevel, PersistenceEngine, PersistenceOption
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -9,7 +10,8 @@ use tempfile::tempdir;
 #[test]
 fn test_initialization_in_memory() {
     let config = DurabilityLevel::InMemory;
-    let engine = PersistenceEngine::<String, String>::new(config).unwrap();
+    let fatal_error = Arc::new(Mutex::new(None));
+    let engine = PersistenceEngine::<String, String>::new(config, fatal_error).unwrap();
     assert!(engine.is_none());
 }
 
@@ -26,7 +28,8 @@ fn test_durable_initialization_creates_files() {
         options: options.clone(),
     };
 
-    let _engine = PersistenceEngine::<String, String>::new(config)
+    let fatal_error = Arc::new(Mutex::new(None));
+    let _engine = PersistenceEngine::<String, String>::new(config, fatal_error)
         .unwrap()
         .unwrap();
 
@@ -47,7 +50,8 @@ fn test_log_writes_to_wal() {
     let config = DurabilityLevel::Full {
         options: PersistenceOptions::new(wal_path.clone()),
     };
-    let engine = PersistenceEngine::<String, String>::new(config)
+    let fatal_error = Arc::new(Mutex::new(None));
+    let engine = PersistenceEngine::<String, String>::new(config, fatal_error)
         .unwrap()
         .unwrap();
 
@@ -84,7 +88,8 @@ fn test_log_triggers_rotation() {
     let config = DurabilityLevel::Full {
         options: options.clone(),
     };
-    let engine = PersistenceEngine::<String, String>::new(config)
+    let fatal_error = Arc::new(Mutex::new(None));
+    let engine = PersistenceEngine::<String, String>::new(config, fatal_error)
         .unwrap()
         .unwrap();
 
@@ -123,7 +128,8 @@ fn test_relaxed_mode_flusher_time_based() {
     };
 
     // Create the engine, which spawns the flusher thread
-    let engine = PersistenceEngine::<String, String>::new(config)
+    let fatal_error = Arc::new(Mutex::new(None));
+    let engine = PersistenceEngine::<String, String>::new(config, fatal_error)
         .unwrap()
         .unwrap();
 
@@ -151,7 +157,8 @@ fn test_relaxed_mode_flushes_on_commit_count() {
         flush_after_n_commits: Some(3),
         flush_after_m_bytes: None,
     };
-    let engine = PersistenceEngine::<String, String>::new(config)
+    let fatal_error = Arc::new(Mutex::new(None));
+    let engine = PersistenceEngine::<String, String>::new(config, fatal_error)
         .unwrap()
         .unwrap();
 
@@ -193,7 +200,8 @@ fn test_relaxed_mode_flushes_on_byte_count() {
         flush_after_n_commits: None,
         flush_after_m_bytes: Some(20),
     };
-    let engine = PersistenceEngine::<String, String>::new(config)
+    let fatal_error = Arc::new(Mutex::new(None));
+    let engine = PersistenceEngine::<String, String>::new(config, fatal_error)
         .unwrap()
         .unwrap();
 
@@ -236,7 +244,8 @@ fn test_snapshotter_frees_segments() {
         options: options.clone(),
     };
 
-    let engine = PersistenceEngine::<String, String>::new(config)
+    let fatal_error = Arc::new(Mutex::new(None));
+    let engine = PersistenceEngine::<String, String>::new(config, fatal_error)
         .unwrap()
         .unwrap();
 

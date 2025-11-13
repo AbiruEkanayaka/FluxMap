@@ -15,7 +15,7 @@ async fn test_autocommit_insert_and_get() {
         .await
         .unwrap();
 
-    let val = handle.get(&"key1".to_string());
+    let val = handle.get(&"key1".to_string()).unwrap();
     assert_eq!(val.as_deref().map(|s| s.as_str()), Some("value1"));
 }
 
@@ -28,13 +28,13 @@ async fn test_autocommit_remove() {
         .insert("key1".to_string(), "value1".to_string())
         .await
         .unwrap();
-    let val = handle.get(&"key1".to_string());
+    let val = handle.get(&"key1".to_string()).unwrap();
     assert!(val.is_some());
 
     let removed_val = handle.remove(&"key1".to_string()).await.unwrap();
     assert_eq!(removed_val.as_deref().map(|s| s.as_str()), Some("value1"));
 
-    let val_after_remove = handle.get(&"key1".to_string());
+    let val_after_remove = handle.get(&"key1".to_string()).unwrap();
     assert!(val_after_remove.is_none());
 }
 
@@ -52,7 +52,7 @@ async fn test_ryow_insert_get() {
         .unwrap();
 
     // 1. Get the value within the same transaction - should see the uncommitted write
-    let val = handle.get(&"ryow_key".to_string());
+    let val = handle.get(&"ryow_key".to_string()).unwrap();
     assert_eq!(
         val.as_deref().map(|s| s.as_str()),
         Some("ryow_value"),
@@ -61,7 +61,7 @@ async fn test_ryow_insert_get() {
 
     // 2. Verify that another handle (using autocommit) doesn't see the value yet
     let other_handle = db.handle();
-    let other_val = other_handle.get(&"ryow_key".to_string());
+    let other_val = other_handle.get(&"ryow_key".to_string()).unwrap();
     assert!(
         other_val.is_none(),
         "Another handle should not see the uncommitted value"
@@ -82,7 +82,7 @@ async fn test_ryow_insert_remove_get() {
         .insert("ryow_key_del".to_string(), "ryow_value_del".to_string())
         .await
         .unwrap();
-    let val_inserted = handle.get(&"ryow_key_del".to_string());
+    let val_inserted = handle.get(&"ryow_key_del".to_string()).unwrap();
     assert_eq!(
         val_inserted.as_deref().map(|s| s.as_str()),
         Some("ryow_value_del")
@@ -96,7 +96,7 @@ async fn test_ryow_insert_remove_get() {
     );
 
     // Get the value within the same transaction - should see None
-    let val_after_remove = handle.get(&"ryow_key_del".to_string());
+    let val_after_remove = handle.get(&"ryow_key_del".to_string()).unwrap();
     assert!(val_after_remove.is_none());
 
     handle.rollback().unwrap();
@@ -115,12 +115,12 @@ async fn test_explicit_commit() {
 
     // Value should not be visible to another transaction before commit
     let other_handle = db.handle();
-    assert!(other_handle.get(&"key1".to_string()).is_none());
+    assert!(other_handle.get(&"key1".to_string()).unwrap().is_none());
 
     handle.commit().await.unwrap();
 
     // Value should be visible after commit
-    let val = other_handle.get(&"key1".to_string());
+    let val = other_handle.get(&"key1".to_string()).unwrap();
     assert_eq!(val.as_deref().map(|s| s.as_str()), Some("value1"));
 }
 
@@ -136,17 +136,17 @@ async fn test_explicit_rollback() {
         .unwrap();
 
     // RYOW should work
-    let val = handle.get(&"key1".to_string());
+    let val = handle.get(&"key1".to_string()).unwrap();
     assert_eq!(val.as_deref().map(|s| s.as_str()), Some("value1"));
 
     handle.rollback().unwrap();
 
     // Value should not be visible after rollback
     let other_handle = db.handle();
-    assert!(other_handle.get(&"key1".to_string()).is_none());
+    assert!(other_handle.get(&"key1".to_string()).unwrap().is_none());
 
     // Trying to get it from the same handle should now use autocommit path and find nothing
-    assert!(handle.get(&"key1".to_string()).is_none());
+    assert!(handle.get(&"key1".to_string()).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -195,12 +195,12 @@ async fn test_serialization_conflict_aborts() {
     h2.begin().unwrap();
 
     // Tx1 reads x and y
-    let x1 = h1.get(&"x".to_string()).unwrap();
-    let y1 = h1.get(&"y".to_string()).unwrap();
+    let x1 = h1.get(&"x".to_string()).unwrap().unwrap();
+    let y1 = h1.get(&"y".to_string()).unwrap().unwrap();
 
     // Tx2 reads x and y
-    let x2 = h2.get(&"x".to_string()).unwrap();
-    let y2 = h2.get(&"y".to_string()).unwrap();
+    let x2 = h2.get(&"x".to_string()).unwrap().unwrap();
+    let y2 = h2.get(&"y".to_string()).unwrap().unwrap();
 
     // Tx1 writes to y based on x
     h1.insert("y".to_string(), *x1 + *y1).await.unwrap(); // y = 10 + 20 = 30
@@ -219,8 +219,8 @@ async fn test_serialization_conflict_aborts() {
 
     // Check final state
     let final_handle = db.handle();
-    let final_x = final_handle.get(&"x".to_string()).unwrap();
-    let final_y = final_handle.get(&"y".to_string()).unwrap();
+    let final_x = final_handle.get(&"x".to_string()).unwrap().unwrap();
+    let final_y = final_handle.get(&"y".to_string()).unwrap().unwrap();
 
     assert_eq!(*final_x, 10); // from setup, because tx2 failed
     assert_eq!(*final_y, 30); // from tx1
@@ -245,7 +245,7 @@ async fn test_transaction_closure_commit() {
     assert_eq!(result.unwrap(), "success");
 
     // Check that the value is visible after the transaction
-    let final_val = handle.get(&"key".to_string());
+    let final_val = handle.get(&"key".to_string()).unwrap();
     assert_eq!(final_val.as_deref().map(|s| s.as_str()), Some("value"));
 }
 
@@ -269,7 +269,7 @@ async fn test_transaction_closure_rollback() {
     assert!(result.is_err());
 
     // Check that the value is NOT visible after the transaction
-    let final_val = handle.get(&"key".to_string());
+    let final_val = handle.get(&"key".to_string()).unwrap();
     assert!(final_val.is_none());
 }
 
@@ -289,7 +289,7 @@ async fn test_drop_rolls_back() {
 
     // A new handle should not see the changes
     let new_handle = db.handle();
-    let val = new_handle.get(&"key".to_string());
+    let val = new_handle.get(&"key".to_string()).unwrap();
     assert!(
         val.is_none(),
         "Changes should be rolled back when handle is dropped"
@@ -370,8 +370,8 @@ async fn test_recovery_on_startup() {
     let handle = db.handle();
 
     // Verify that the data from the first session is present.
-    assert_eq!(*handle.get(&"key1".to_string()).unwrap(), 1);
-    assert_eq!(*handle.get(&"key2".to_string()).unwrap(), 2);
+    assert_eq!(*handle.get(&"key1".to_string()).unwrap().unwrap(), 1);
+    assert_eq!(*handle.get(&"key2".to_string()).unwrap().unwrap(), 2);
 }
 
 #[tokio::test]
@@ -382,7 +382,7 @@ async fn test_autocommit_range_scan() {
     handle.insert("b".to_string(), 2).await.unwrap();
     handle.insert("c".to_string(), 3).await.unwrap();
 
-    let results = handle.range(&"a".to_string(), &"b".to_string());
+    let results = handle.range(&"a".to_string(), &"b".to_string()).unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].0, "a");
     assert_eq!(*results[1].1, 2);
@@ -400,7 +400,7 @@ async fn test_transactional_prefix_scan() {
     // In transaction, update a value that will be part of the scan
     handle.insert("user:3".to_string(), 300).await.unwrap();
 
-    let results = handle.prefix_scan("user:");
+    let results = handle.prefix_scan("user:").unwrap();
     assert_eq!(results.len(), 3);
     assert!(results.iter().any(|(k, _)| k == "user:1"));
     assert!(results.iter().any(|(k, _)| k == "user:2"));
@@ -409,7 +409,7 @@ async fn test_transactional_prefix_scan() {
     handle.commit().await.unwrap();
 
     // Verify after commit
-    let final_results = db.handle().prefix_scan("user:");
+    let final_results = db.handle().prefix_scan("user:").unwrap();
     assert_eq!(final_results.len(), 3);
 }
 
@@ -426,7 +426,7 @@ async fn test_scan_induces_serialization_conflict() {
 
     // Tx1 starts and scans a range including "b"
     h1.begin().unwrap();
-    let range = h1.range(&"a".to_string(), &"c".to_string());
+    let range = h1.range(&"a".to_string(), &"c".to_string()).unwrap();
     assert_eq!(range.len(), 1);
     assert_eq!(range[0].0, "b");
 
@@ -444,7 +444,7 @@ async fn test_scan_induces_serialization_conflict() {
 
     // Check final state
     let final_handle = db.handle();
-    let final_b = final_handle.get(&"b".to_string()).unwrap();
+    let final_b = final_handle.get(&"b".to_string()).unwrap().unwrap();
     assert_eq!(*final_b, 20); // from tx2
 }
 
@@ -457,7 +457,7 @@ async fn test_phantom_read_prevention_for_range_scan() {
 
     // Tx1 starts and scans an empty range.
     h1.begin().unwrap();
-    let range = h1.range(&"a".to_string(), &"c".to_string());
+    let range = h1.range(&"a".to_string(), &"c".to_string()).unwrap();
     assert!(range.is_empty());
 
     // Tx2 starts, INSERTS a key into that range, and commits.
@@ -473,7 +473,7 @@ async fn test_phantom_read_prevention_for_range_scan() {
 
     // Check final state
     let final_handle = db.handle();
-    let final_b = final_handle.get(&"b".to_string()).unwrap();
+    let final_b = final_handle.get(&"b".to_string()).unwrap().unwrap();
     assert_eq!(*final_b, 100); // from tx2
 }
 
@@ -486,7 +486,7 @@ async fn test_phantom_read_prevention_for_prefix_scan() {
 
     // Tx1 starts and scans an empty prefix.
     h1.begin().unwrap();
-    let range = h1.prefix_scan("user:");
+    let range = h1.prefix_scan("user:").unwrap();
     assert!(range.is_empty());
 
     // Tx2 starts, INSERTS a key with that prefix, and commits.
@@ -502,6 +502,6 @@ async fn test_phantom_read_prevention_for_prefix_scan() {
 
     // Check final state
     let final_handle = db.handle();
-    let final_b = final_handle.get(&"user:jane".to_string()).unwrap();
+    let final_b = final_handle.get(&"user:jane".to_string()).unwrap().unwrap();
     assert_eq!(*final_b, 200); // from tx2
 }

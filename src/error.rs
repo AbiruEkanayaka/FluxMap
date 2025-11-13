@@ -23,6 +23,9 @@ pub enum FluxError {
     EvictionError,
     /// Represents an error in the database configuration.
     Configuration(String),
+    /// A fatal, unrecoverable error occurred in a background task, such as the persistence engine.
+    /// The database is in an indeterminate state and cannot accept further operations.
+    FatalPersistenceError(String),
 }
 
 /// A specific error originating from the persistence layer.
@@ -63,6 +66,9 @@ impl fmt::Display for FluxError {
             FluxError::Persistence(e) => write!(f, "Persistence error: {}", e),
             FluxError::EvictionError => write!(f, "Eviction error: could not find or evict a key"),
             FluxError::Configuration(e) => write!(f, "Configuration error: {}", e),
+            FluxError::FatalPersistenceError(e) => {
+                write!(f, "Fatal persistence error: {}. The database is in a terminal state.", e)
+            }
         }
     }
 }

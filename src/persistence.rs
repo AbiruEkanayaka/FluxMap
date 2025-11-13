@@ -25,6 +25,7 @@
 use crate::SkipList;
 use crate::mem::MemSize;
 use crate::transaction::Workspace;
+use log::error;
 use rustix::fs::FallocateFlags;
 use rustix::fs::fallocate;
 use serde::{Deserialize, Serialize};
@@ -180,6 +181,7 @@ pub struct PersistenceEngine<K, V> {
     // Handles for our background threads
     _flusher_handle: Option<JoinHandle<()>>,
     _snapshotter_handle: Option<JoinHandle<()>>,
+    fatal_error: Arc<Mutex<Option<String>>>,
     _phantom: PhantomData<(K, V)>,
 }
 
@@ -235,7 +237,10 @@ where
     ///
     /// If the level is `InMemory`, it returns `Ok(None)`.
     /// Otherwise, it initializes the WAL files and starts the necessary background threads.
-    pub fn new(config: DurabilityLevel) -> io::Result<Option<Self>> {
+    pub fn new(
+        config: DurabilityLevel,
+        fatal_error: Arc<Mutex<Option<String>>>,
+    ) -> io::Result<Option<Self>> {
         if let DurabilityLevel::InMemory = &config {
             return Ok(None);
         }
@@ -264,8 +269,14 @@ where
         let snapshot_path_clone = snapshot_path.clone();
         let wal_path_clone = options.wal_path.clone();
         let shutdown_clone_snap = Arc::clone(&shutdown);
+        let fatal_error_clone_snap = fatal_error.clone();
         let snapshotter_handle = std::thread::spawn(move || {
             while !shutdown_clone_snap.load(Ordering::Relaxed) {
+                // Check for fatal error before proceeding
+                if fatal_error_clone_snap.lock().unwrap().is_some() {
+                    break;
+                }
+
                 let segment_idx = match rx_clone_snap
                     .lock()
                     .expect("Snapshot queue mutex poisoned")
@@ -285,7 +296,7 @@ where
                     let (lock, _) = &*segment.state;
                     let state = lock.lock().expect("WalSegment state mutex poisoned");
                     if *state != WalSegmentState::PendingSnapshot {
-                        eprintln!(
+                        error!(
                             "Snapshotter: Segment {} in unexpected state: {:?}",
                             segment_idx, *state
                         );
@@ -295,16 +306,20 @@ where
 
                 let mut snapshot_data: SnapshotData<K, V> = if snapshot_path_clone.exists() {
                     match File::open(&snapshot_path_clone) {
-                        Ok(file) => ciborium::from_reader(file).unwrap_or_else(|e| {
-                            // A corrupted snapshot is a fatal error. We cannot safely proceed
-                            // as it would mean losing all previously snapshotted data.
-                            panic!(
-                                "FATAL: Snapshot file at {:?} is corrupted and could not be deserialized: {}. Manual intervention required.",
-                                snapshot_path_clone, e
-                            );
-                        }),
+                        Ok(file) => match ciborium::from_reader(file) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                let err_msg = format!(
+                                    "Snapshot file at {:?} is corrupted and could not be deserialized: {}. Manual intervention required.",
+                                    snapshot_path_clone, e
+                                );
+                                error!("FATAL: {}", err_msg);
+                                *fatal_error_clone_snap.lock().unwrap() = Some(err_msg);
+                                return; // Exit thread on fatal error
+                            }
+                        },
                         Err(e) => {
-                            eprintln!("Snapshotter: Failed to open existing snapshot file {:?}: {}", snapshot_path_clone, e);
+                            error!("Snapshotter: Failed to open existing snapshot file {:?}: {}", snapshot_path_clone, e);
                             SnapshotData::default()
                         }
                     }
@@ -335,7 +350,7 @@ where
                                 break; // Reached end of file
                             }
                             Err(e) => {
-                                eprintln!(
+                                error!(
                                     "Snapshotter: Failed to deserialize workspace from WAL segment {:?}: {}",
                                     wal_file_path, e
                                 );
@@ -344,7 +359,7 @@ where
                         }
                     }
                 } else {
-                    eprintln!(
+                    error!(
                         "Snapshotter: Failed to open WAL segment file {:?}.",
                         wal_file_path
                     );
@@ -368,32 +383,31 @@ where
                 })();
 
                 if let Err(e) = write_result {
-                    // This is a critical failure. If we can't write snapshots, we can't
-                    // reclaim WAL space, and the system will eventually deadlock.
-                    // Panicking is the safest option to alert the operator and prevent
-                    // silent failure.
                     let _ = fs::remove_file(&tmp_snapshot_path); // Attempt to clean up
-                    panic!(
-                        "FATAL: Snapshotter failed to write or rename snapshot file {:?}: {}. Shutting down to prevent data loss or deadlock.",
+                    let err_msg = format!(
+                        "Snapshotter failed to write or rename snapshot file {:?}: {}. Shutting down to prevent data loss or deadlock.",
                         snapshot_path_clone, e
                     );
+                    error!("FATAL: {}", err_msg);
+                    *fatal_error_clone_snap.lock().unwrap() = Some(err_msg);
+                    return; // Exit thread on fatal error
                 } else {
                     // Truncate the WAL file to mark it as free.
                     if let Ok(mut file) = segment.file.lock() {
                         if let Err(e) = file.set_len(0) {
-                            eprintln!(
+                            error!(
                                 "Snapshotter: Failed to truncate WAL segment file {}: {}",
                                 segment_idx, e
                             );
                         }
                         if let Err(e) = file.seek(SeekFrom::Start(0)) {
-                            eprintln!(
+                            error!(
                                 "Snapshotter: Failed to seek WAL segment file {}: {}",
                                 segment_idx, e
                             );
                         }
                     } else {
-                        eprintln!(
+                        error!(
                             "Snapshotter: Failed to lock WAL segment file {} for truncation.",
                             segment_idx
                         );
@@ -419,6 +433,7 @@ where
             let flush_signal_clone = Arc::clone(&flush_signal);
             let commits_clone = Arc::clone(&commits_since_flush);
             let bytes_clone = Arc::clone(&bytes_since_flush);
+            let fatal_error_clone_flush = fatal_error.clone();
 
             Some(std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -428,7 +443,9 @@ where
 
                 runtime.block_on(async move {
                     loop {
-                        if shutdown_clone_flush.load(Ordering::Relaxed) {
+                        if shutdown_clone_flush.load(Ordering::Relaxed)
+                            || fatal_error_clone_flush.lock().unwrap().is_some()
+                        {
                             break;
                         }
 
@@ -456,7 +473,9 @@ where
                         let idx = current_idx_clone_flush.load(Ordering::Relaxed);
                         let segment = &segments_clone_flush[idx];
                         if let Ok(file) = segment.file.lock() {
-                            if file.sync_all().is_ok() {
+                            if let Err(e) = file.sync_all() {
+                                error!("Flusher thread failed to sync WAL segment {}: {}", idx, e);
+                            } else {
                                 // Reset counters on successful flush
                                 commits_clone.store(0, Ordering::Relaxed);
                                 bytes_clone.store(0, Ordering::Relaxed);
@@ -484,6 +503,7 @@ where
             _snapshot_queue_rx: snapshot_queue_rx,
             _flusher_handle: flusher_handle,
             _snapshotter_handle: Some(snapshotter_handle),
+            fatal_error,
             _phantom: PhantomData,
         }))
     }
@@ -517,7 +537,7 @@ where
         // 2. Populate skiplist from snapshot data in a single transaction
         let tx = tx_manager.begin();
         for (key, value) in snapshot_data.data {
-            skiplist.insert(key, value, &tx).await;
+            let _ = skiplist.insert(key, value, &tx).await;
         }
 
         // 3. Find WALs to replay, sorted by modification time
@@ -564,7 +584,9 @@ where
                 while let Ok(workspace) = ciborium::from_reader::<Workspace<K, V>, _>(&mut reader) {
                     for (key, value) in workspace {
                         match value {
-                            Some(val) => skiplist.insert(key, val, &tx).await,
+                            Some(val) => {
+                                let _ = skiplist.insert(key, val, &tx).await;
+                            }
                             None => {
                                 skiplist.remove(&key, &tx).await;
                             }
@@ -691,13 +713,14 @@ where
 
         // Send the old segment to the snapshotter
         if let Err(e) = self.snapshot_queue_tx.send(current_idx) {
-            eprintln!(
-                "FATAL: Snapshotter thread has died. Cannot send segment {} for snapshotting. Error: {}",
+            let err_msg = format!(
+                "Snapshotter thread has died. Cannot send segment {} for snapshotting. Error: {}",
                 current_idx, e
             );
+            error!("FATAL: {}", err_msg);
+            *self.fatal_error.lock().unwrap() = Some(err_msg);
             // This is a critical error. The system can no longer guarantee durability
-            // or reclaim space. A real-world implementation might need to panic,
-            // enter a read-only mode, or shut down gracefully here.
+            // or reclaim space. By setting the fatal error, we prevent further writes.
         }
 
         // Reset writer position and update current segment index
@@ -725,12 +748,12 @@ impl<K, V> Drop for PersistenceEngine<K, V> {
 
         if let Some(handle) = self._flusher_handle.take() {
             if let Err(e) = handle.join() {
-                eprintln!("Flusher thread panicked: {:?}", e);
+                error!("Flusher thread panicked: {:?}", e);
             }
         }
         if let Some(handle) = self._snapshotter_handle.take() {
             if let Err(e) = handle.join() {
-                eprintln!("Snapshotter thread panicked: {:?}", e);
+                error!("Snapshotter thread panicked: {:?}", e);
             }
         }
     }

@@ -32,6 +32,7 @@ pub mod mem;
 pub mod persistence;
 pub mod transaction;
 pub mod vacuum;
+pub mod arc;
 use crate::mem::{EvictionPolicy, MemSize};
 pub use crate::transaction::{Snapshot, Transaction, TransactionManager, TxId, Version};
 pub use persistence::{DurabilityLevel, PersistenceEngine, PersistenceOptions};
@@ -443,13 +444,13 @@ where
     /// If the key does not exist, this creates a new `Node` and links it into the skiplist.
     ///
     /// This operation adds the key to the transaction's write set for SSI conflict detection.
-    pub async fn insert(&self, key: K, value: Arc<V>, transaction: &Transaction<K, V>) {
+    pub async fn insert(&self, key: K, value: Arc<V>, transaction: &Transaction<K, V>) -> u64 {
         transaction.write_set.insert(key.clone());
         let new_level = self.random_level();
         let mut attempts = 0;
 
         loop {
-            let action = {
+            let (action, size) = {
                 let guard = &crossbeam_epoch::pin();
                 let predecessors = self.find_predecessors::<K>(&key, guard);
                 let predecessor = predecessors[0];
@@ -509,9 +510,9 @@ where
                             expirer_txid: AtomicU64::new(0),
                         };
                         let version_size =
-                            std::mem::size_of::<VersionNode<Arc<V>>>() + value.mem_size();
+                            (std::mem::size_of::<VersionNode<Arc<V>>>() + value.mem_size()) as u64;
                         self.current_memory_bytes
-                            .fetch_add(version_size as u64, Ordering::Relaxed);
+                            .fetch_add(version_size, Ordering::Relaxed);
 
                         let new_version_node = VersionNode::new(new_version);
                         let new_version_node_shared = new_version_node.into_shared(guard);
@@ -536,20 +537,20 @@ where
                                 Ordering::Acquire,
                                 guard,
                             ) {
-                                Ok(_) => break InsertAction::Return, // Success
-                                Err(_) => continue,                  // Contention, retry CAS loop
+                                Ok(_) => break (InsertAction::Return, version_size), // Success
+                                Err(_) => continue, // Contention, retry CAS loop
                             }
                         }
                     } else {
                         // Key does not exist, create a new node.
                         transaction.insert_set.insert(key.clone());
-                        let node_size = std::mem::size_of::<Node<K, V>>()
+                        let node_size = (std::mem::size_of::<Node<K, V>>()
                             + ((new_level + 1) * std::mem::size_of::<Atomic<Node<K, V>>>())
                             + std::mem::size_of::<VersionNode<Arc<V>>>()
                             + key.mem_size()
-                            + value.mem_size();
+                            + value.mem_size()) as u64;
                         self.current_memory_bytes
-                            .fetch_add(node_size as u64, Ordering::Relaxed);
+                            .fetch_add(node_size, Ordering::Relaxed);
 
                         let new_node = Node::new(
                             key.clone(),
@@ -579,7 +580,7 @@ where
                         }
                         .is_err()
                         {
-                            InsertAction::YieldAndRetry // Contention, retry whole operation.
+                            (InsertAction::YieldAndRetry, node_size) // Contention, retry whole operation.
                         } else {
                             // Link the node at higher levels.
                             self.link_new_node(
@@ -589,19 +590,19 @@ where
                                 new_level,
                                 guard,
                             );
-                            InsertAction::Return
+                            (InsertAction::Return, node_size)
                         }
                     }
                 } else {
                     // List is empty or we are at the end. Create a new node.
                     transaction.insert_set.insert(key.clone());
-                    let node_size = std::mem::size_of::<Node<K, V>>()
+                    let node_size = (std::mem::size_of::<Node<K, V>>()
                         + ((new_level + 1) * std::mem::size_of::<Atomic<Node<K, V>>>())
                         + std::mem::size_of::<VersionNode<Arc<V>>>()
                         + key.mem_size()
-                        + value.mem_size();
+                        + value.mem_size()) as u64;
                     self.current_memory_bytes
-                        .fetch_add(node_size as u64, Ordering::Relaxed);
+                        .fetch_add(node_size, Ordering::Relaxed);
 
                     let new_node = Node::new(
                         key.clone(),
@@ -629,16 +630,18 @@ where
                     }
                     .is_err()
                     {
-                        InsertAction::YieldAndRetry
+                        (InsertAction::YieldAndRetry, node_size)
                     } else {
                         self.link_new_node(&key, predecessors, new_node_shared, new_level, guard);
-                        InsertAction::Return
+                        (InsertAction::Return, node_size)
                     }
                 }
             };
 
             match action {
                 InsertAction::YieldAndRetry => {
+                    // If we are retrying, we must subtract the memory we optimistically added.
+                    self.current_memory_bytes.fetch_sub(size, Ordering::Relaxed);
                     attempts += 1;
                     if attempts < 5 {
                         // Yield for a few attempts before sleeping.
@@ -650,23 +653,25 @@ where
                     }
                     continue; // Continue the outer loop to retry the insert operation
                 }
-                InsertAction::Return => return,
+                InsertAction::Return => return size,
             }
         }
     }
 
     /// Dispatches to the appropriate victim-finding strategy based on the policy.
-    pub fn find_victim_key(&self, policy: EvictionPolicy) -> Option<K> {
+    pub fn find_victim_key(&self, policy: EvictionPolicy, spare_key: Option<&K>) -> Option<K> {
         match policy {
-            EvictionPolicy::Lru => self.find_lru_victim_key(),
-            EvictionPolicy::Lfu => self.find_lfu_victim_key(),
+            EvictionPolicy::Lru => self.find_lru_victim_key(spare_key),
+            EvictionPolicy::Lfu => self.find_lfu_victim_key(spare_key),
+            EvictionPolicy::Random => self.find_random_victim_key(spare_key),
+            EvictionPolicy::Arc => {
+                unreachable!("ARC policy eviction should be handled by the Database module, not the SkipList.")
+            }
         }
     }
 
-    /// Finds a potential victim key for eviction using a random sampling LFU strategy.
-    ///
-    /// Tie-breaking is done by LRU.
-    pub fn find_lfu_victim_key(&self) -> Option<K> {
+    /// Finds a potential victim key for eviction using a random sampling strategy.
+    pub fn find_random_victim_key(&self, spare_key: Option<&K>) -> Option<K> {
         const SAMPLE_SIZE: usize = 20;
         let guard = &crossbeam_epoch::pin();
 
@@ -680,6 +685,60 @@ where
         let mut i = 0;
         while let Some(node_ref) = unsafe { current.as_ref() } {
             if node_ref.key.is_some() && !node_ref.deleted.load(Ordering::Acquire) {
+                // Do not consider the spare key as a candidate for eviction.
+                if spare_key.is_some() && node_ref.key.as_ref() == spare_key {
+                    current = node_ref.next[0].load(Ordering::Relaxed, guard);
+                    continue;
+                }
+
+                if i < SAMPLE_SIZE {
+                    samples.push(current);
+                } else {
+                    let j = fastrand::usize(..=i);
+                    if j < SAMPLE_SIZE {
+                        samples[j] = current;
+                    }
+                }
+                i += 1;
+            }
+            current = node_ref.next[0].load(Ordering::Relaxed, guard);
+        }
+
+        if samples.is_empty() {
+            return None;
+        }
+
+        // Pick a random node from the collected samples.
+        let random_index = fastrand::usize(..samples.len());
+        let random_node_shared = samples[random_index];
+
+        let random_node = unsafe { random_node_shared.as_ref().unwrap() };
+        random_node.key.clone()
+    }
+
+    /// Finds a potential victim key for eviction using a random sampling LFU strategy.
+    ///
+    /// Tie-breaking is done by LRU.
+    pub fn find_lfu_victim_key(&self, spare_key: Option<&K>) -> Option<K> {
+        const SAMPLE_SIZE: usize = 20;
+        let guard = &crossbeam_epoch::pin();
+
+        let mut samples = Vec::with_capacity(SAMPLE_SIZE);
+        let mut current = self.head.load(Ordering::Relaxed, guard);
+
+        // Skip the head node
+        current = unsafe { current.deref().next[0].load(Ordering::Relaxed, guard) };
+
+        // Reservoir sampling to get a random set of nodes
+        let mut i = 0;
+        while let Some(node_ref) = unsafe { current.as_ref() } {
+            if node_ref.key.is_some() && !node_ref.deleted.load(Ordering::Acquire) {
+                // Do not consider the spare key as a candidate for eviction.
+                if spare_key.is_some() && node_ref.key.as_ref() == spare_key {
+                    current = node_ref.next[0].load(Ordering::Relaxed, guard);
+                    continue;
+                }
+
                 if i < SAMPLE_SIZE {
                     samples.push(current);
                 } else {
@@ -715,7 +774,7 @@ where
     }
 
     /// Finds a potential victim key for eviction using a random sampling LRU strategy.
-    pub fn find_lru_victim_key(&self) -> Option<K> {
+    pub fn find_lru_victim_key(&self, spare_key: Option<&K>) -> Option<K> {
         const SAMPLE_SIZE: usize = 20;
         let guard = &crossbeam_epoch::pin();
 
@@ -729,6 +788,12 @@ where
         let mut i = 0;
         while let Some(node_ref) = unsafe { current.as_ref() } {
             if node_ref.key.is_some() && !node_ref.deleted.load(Ordering::Acquire) {
+                // Do not consider the spare key as a candidate for eviction.
+                if spare_key.is_some() && node_ref.key.as_ref() == spare_key {
+                    current = node_ref.next[0].load(Ordering::Relaxed, guard);
+                    continue;
+                }
+
                 if i < SAMPLE_SIZE {
                     samples.push(current);
                 } else {

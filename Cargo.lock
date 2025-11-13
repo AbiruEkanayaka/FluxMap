@@ -236,7 +236,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fluxmap"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -247,6 +247,7 @@ dependencies = [
  "dashmap",
  "fastrand",
  "futures",
+ "log",
  "rand",
  "rustix",
  "serde",
@@ -417,6 +418,12 @@ checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
 ]
+
+[[package]]
+name = "log"
+version = "0.4.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
 
 [[package]]
 name = "memchr"

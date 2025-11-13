@@ -16,7 +16,7 @@
 //!
 //! // Each operation is a small, independent transaction.
 //! handle.insert("key1".to_string(), "value1".to_string()).await.unwrap();
-//! let value = handle.get(&"key1".to_string()).unwrap();
+//! let value = handle.get(&"key1".to_string()).unwrap().unwrap();
 //!
 //! assert_eq!(*value, "value1");
 //! # }
@@ -40,8 +40,8 @@
 //!
 //! // Atomically transfer 20 from Alice to Bob.
 //! handle.transaction(|h| Box::pin(async move {
-//!     let alice_balance = h.get(&"alice".to_string()).unwrap();
-//!     let bob_balance = h.get(&"bob".to_string()).unwrap();
+//!     let alice_balance = h.get(&"alice".to_string()).unwrap().unwrap();
+//!     let bob_balance = h.get(&"bob".to_string()).unwrap().unwrap();
 //!
 //!     h.insert("alice".to_string(), *alice_balance - 20).await?;
 //!     h.insert("bob".to_string(), *bob_balance + 20).await?;
@@ -49,8 +49,8 @@
 //!     Ok::<_, FluxError>(()) // Commit the changes
 //! })).await?;
 //!
-//! let final_alice = handle.get(&"alice".to_string()).unwrap();
-//! let final_bob = handle.get(&"bob".to_string()).unwrap();
+//! let final_alice = handle.get(&"alice".to_string()).unwrap().unwrap();
+//! let final_bob = handle.get(&"bob".to_string()).unwrap().unwrap();
 //!
 //! assert_eq!(*final_alice, 80);
 //! assert_eq!(*final_bob, 70);
@@ -58,20 +58,23 @@
 //! # }
 //! ```
 
-use crate::SkipList;
+use crate::arc::ArcManager;
 use crate::error::{FluxError, PersistenceError};
 use crate::mem::{EvictionPolicy, MemSize};
 use crate::persistence::{DurabilityLevel, PersistenceEngine, PersistenceOptions};
+use crate::SkipList;
 use crate::transaction::Transaction;
 use futures::stream::StreamExt;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use log::error;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::hash::Hash;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -146,7 +149,7 @@ where
         + Send
         + Sync
         + 'static
-        + std::hash::Hash
+        + Hash
         + Eq
         + Serialize
         + for<'de> Deserialize<'de>
@@ -216,6 +219,8 @@ where
 
     /// Builds the `Database` instance with the specified configurations.
     pub async fn build(self) -> Result<Database<K, V>, FluxError> {
+        let fatal_error = Arc::new(Mutex::new(None));
+
         let durability = match self.persistence_options {
             Some(options) => {
                 if self.is_full_durability {
@@ -239,7 +244,8 @@ where
             None => DurabilityLevel::InMemory,
         };
 
-        let persistence_engine = PersistenceEngine::new(durability)?.map(Arc::new);
+        let persistence_engine =
+            PersistenceEngine::new(durability, fatal_error.clone())?.map(Arc::new);
 
         let current_memory_bytes = Arc::new(AtomicU64::new(0));
         let access_clock = Arc::new(AtomicU64::new(0));
@@ -274,12 +280,24 @@ where
                             break;
                         }
                         if let Err(e) = skiplist_clone.vacuum().await {
-                            eprintln!("Automatic vacuuming failed: {:?}", e);
+                            error!("Automatic vacuuming failed: {:?}", e);
                         }
                     }
                 });
             });
             Some(handle)
+        } else {
+            None
+        };
+
+        let arc_manager = if self.eviction_policy == EvictionPolicy::Arc {
+            if let Some(max_mem) = self.max_memory_bytes {
+                Some(Arc::new(Mutex::new(ArcManager::new(max_mem))))
+            } else {
+                return Err(FluxError::Configuration(
+                    "Arc eviction policy requires max_memory to be set.".to_string(),
+                ));
+            }
         } else {
             None
         };
@@ -292,6 +310,8 @@ where
             max_memory_bytes: self.max_memory_bytes,
             current_memory_bytes,
             eviction_policy: self.eviction_policy,
+            arc_manager,
+            fatal_error,
         })
     }
 }
@@ -310,7 +330,7 @@ where
         + Send
         + Sync
         + 'static
-        + std::hash::Hash
+        + Hash
         + Eq
         + Serialize
         + DeserializeOwned
@@ -331,6 +351,10 @@ where
     current_memory_bytes: Arc<AtomicU64>,
     /// The configured memory eviction policy.
     eviction_policy: EvictionPolicy,
+    /// The manager for the ARC eviction policy, if enabled.
+    arc_manager: Option<Arc<Mutex<ArcManager<K>>>>,
+    /// A container for a fatal error message from a background thread.
+    fatal_error: Arc<Mutex<Option<String>>>,
 }
 
 impl<K, V> Drop for Database<K, V>
@@ -352,7 +376,7 @@ where
         self.shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self._vacuum_handle.take() {
             if let Err(e) = handle.join() {
-                eprintln!("Automatic vacuum thread panicked: {:?}", e);
+                error!("Automatic vacuum thread panicked: {:?}", e);
             }
         }
     }
@@ -374,10 +398,10 @@ where
     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
 {
     /// Checks if memory usage exceeds the configured limit and evicts keys until it's under the limit.
-    async fn evict_if_needed(&self) {
+    async fn evict_if_needed(&self, spare_key: Option<&K>) {
         if let Some(max_mem) = self.max_memory_bytes {
             while self.current_memory_bytes.load(Ordering::Relaxed) > max_mem {
-                if self.evict_one().await.is_err() {
+                if self.evict_one(spare_key).await.is_err() {
                     // Could not find a victim or eviction failed, stop trying for now.
                     break;
                 }
@@ -386,8 +410,15 @@ where
     }
 
     /// Finds and evicts a single victim based on the configured eviction policy.
-    async fn evict_one(&self) -> Result<(), FluxError> {
-        if let Some(victim_key) = self.skiplist.find_victim_key(self.eviction_policy) {
+    async fn evict_one(&self, spare_key: Option<&K>) -> Result<(), FluxError> {
+        let victim_key = if let Some(manager) = &self.arc_manager {
+            manager.lock().unwrap().find_victim()
+        } else {
+            self.skiplist
+                .find_victim_key(self.eviction_policy, spare_key)
+        };
+
+        if let Some(victim_key) = victim_key {
             // The eviction in the skiplist is synchronous and updates the counter.
             // We don't need to do anything with a transaction here, as the eviction
             // is a low-level administrative task that marks the node as dead.
@@ -466,6 +497,8 @@ where
             skiplist: &self.skiplist,
             active_tx: None,
             persistence_engine: &self.persistence_engine,
+            arc_manager: &self.arc_manager,
+            fatal_error: &self.fatal_error,
         }
     }
 }
@@ -492,7 +525,7 @@ where
         + Send
         + Sync
         + 'static
-        + std::hash::Hash
+        + Hash
         + Eq
         + Serialize
         + DeserializeOwned
@@ -508,6 +541,8 @@ where
     #[cfg(not(test))]
     active_tx: Option<Arc<Transaction<K, V>>>,
     persistence_engine: &'db Option<Arc<PersistenceEngine<K, V>>>,
+    arc_manager: &'db Option<Arc<Mutex<ArcManager<K>>>>,
+    fatal_error: &'db Arc<Mutex<Option<String>>>,
 }
 
 impl<'db, K, V> Drop for Handle<'db, K, V>
@@ -517,7 +552,7 @@ where
         + Send
         + Sync
         + 'static
-        + std::hash::Hash
+        + Hash
         + Eq
         + Serialize
         + DeserializeOwned
@@ -541,7 +576,7 @@ where
         + Send
         + Sync
         + 'static
-        + std::hash::Hash
+        + Hash
         + Eq
         + Serialize
         + DeserializeOwned
@@ -549,6 +584,14 @@ where
         + Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
+    /// Checks if a fatal error has occurred in a background thread.
+    fn check_fatal_error(&self) -> Result<(), FluxError> {
+        if let Some(err_msg) = self.fatal_error.lock().unwrap().as_ref() {
+            return Err(FluxError::FatalPersistenceError(err_msg.clone()));
+        }
+        Ok(())
+    }
+
     /// Retrieves a value from the database.
     ///
     /// - If an explicit transaction is active, this read is part of that transaction.
@@ -568,29 +611,33 @@ where
     /// let handle = db.handle();
     /// handle.insert("key".to_string(), 123).await.unwrap();
     ///
-    /// let value = handle.get(&"key".to_string()).unwrap();
+    /// let value = handle.get(&"key".to_string()).unwrap().unwrap();
     /// assert_eq!(*value, 123);
     ///
-    /// assert!(handle.get(&"non-existent-key".to_string()).is_none());
+    /// assert!(handle.get(&"non-existent-key".to_string()).unwrap().is_none());
     /// # }
     /// ```
-    pub fn get(&self, key: &K) -> Option<Arc<V>> {
+    pub fn get(&self, key: &K) -> Result<Option<Arc<V>>, FluxError> {
+        self.check_fatal_error()?;
         if let Some(active_tx) = &self.active_tx {
             // --- Explicit Transaction Path ---
             // 1. Check workspace for writes made within this transaction (RYOW).
             let workspace = active_tx.workspace.read().unwrap();
             if let Some(workspace_value) = workspace.get(key.borrow()) {
-                return workspace_value.clone();
+                return Ok(workspace_value.clone());
             }
             // 2. Not in workspace, read from skiplist using the transaction's snapshot.
-            self.skiplist.get(key, active_tx)
+            Ok(self.skiplist.get(key, active_tx))
         } else {
             // --- Autocommit Path ---
             let tx_manager = self.skiplist.transaction_manager();
             let tx = tx_manager.begin();
             let result = self.skiplist.get(key, &tx);
+            if let (Some(manager), Some(_)) = (&self.arc_manager, &result) {
+                manager.lock().unwrap().hit(key);
+            }
             tx_manager.commit(&tx, || Ok(())).unwrap(); // Autocommit for reads cannot fail.
-            result
+            Ok(result)
         }
     }
 
@@ -617,11 +664,12 @@ where
     /// // Update the key
     /// handle.insert("key".to_string(), 2).await.unwrap();
     ///
-    /// let value = handle.get(&"key".to_string()).unwrap();
+    /// let value = handle.get(&"key".to_string()).unwrap().unwrap();
     /// assert_eq!(*value, 2);
     /// # }
     /// ```
     pub async fn insert(&self, key: K, value: V) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
         if let Some(active_tx) = &self.active_tx {
             // --- Explicit Transaction Path ---
             active_tx
@@ -635,8 +683,9 @@ where
             let tx_manager = self.skiplist.transaction_manager();
             let tx = tx_manager.begin();
 
-            // Provisionally apply the write.
-            self.skiplist
+            let key_for_eviction = key.clone();
+            let allocated_size = self
+                .skiplist
                 .insert(key.clone(), Arc::new(value.clone()), &tx)
                 .await;
 
@@ -657,7 +706,13 @@ where
             // Attempt to commit with the WAL hook.
             match tx_manager.commit(&tx, on_pre_commit) {
                 Ok(()) => {
-                    self.db.evict_if_needed().await;
+                    if let Some(manager) = &self.arc_manager {
+                        manager
+                            .lock()
+                            .unwrap()
+                            .miss(key_for_eviction.clone(), allocated_size as usize);
+                    }
+                    self.db.evict_if_needed(Some(&key_for_eviction)).await;
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -691,10 +746,11 @@ where
     /// let removed_value = handle.remove(&"key".to_string()).await.unwrap().unwrap();
     /// assert_eq!(*removed_value, 123);
     ///
-    /// assert!(handle.get(&"key".to_string()).is_none());
+    /// assert!(handle.get(&"key".to_string()).unwrap().is_none());
     /// # }
     /// ```
     pub async fn remove(&self, key: &K) -> Result<Option<Arc<V>>, FluxError> {
+        self.check_fatal_error()?;
         if let Some(active_tx) = &self.active_tx {
             // --- Explicit Transaction Path ---
             let mut workspace = active_tx.workspace.write().unwrap();
@@ -763,13 +819,14 @@ where
     /// handle.begin().unwrap();
     /// handle.insert("b".to_string(), 2).await.unwrap(); // Uncommitted
     ///
-    /// let results = handle.range(&"a".to_string(), &"c".to_string());
+    /// let results = handle.range(&"a".to_string(), &"c".to_string()).unwrap();
     /// assert_eq!(results.len(), 3); // Sees the uncommitted "b"
     /// assert_eq!(results[1].0, "b");
     /// # handle.commit().await.unwrap();
     /// # }
     /// ```
-    pub fn range(&self, start: &K, end: &K) -> Vec<(K, Arc<V>)> {
+    pub fn range(&self, start: &K, end: &K) -> Result<Vec<(K, Arc<V>)>, FluxError> {
+        self.check_fatal_error()?;
         if let Some(active_tx) = &self.active_tx {
             // --- Explicit Transaction Path with RYOW ---
             active_tx
@@ -801,14 +858,14 @@ where
                     }
                 }
             }
-            results.into_iter().collect()
+            Ok(results.into_iter().collect())
         } else {
             // --- Autocommit Path ---
             let tx_manager = self.skiplist.transaction_manager();
             let tx = tx_manager.begin();
             let results = self.skiplist.range(start, end, &tx);
             tx_manager.commit(&tx, || Ok(())).unwrap(); // Autocommit for reads cannot fail.
-            results
+            Ok(results)
         }
     }
 
@@ -827,11 +884,19 @@ where
         end: &'a K,
     ) -> impl futures::stream::Stream<Item = (K, Arc<V>)> + 'a {
         async_stream::stream! {
+            if self.check_fatal_error().is_err() {
+                // How to yield an error from an async_stream?
+                // The stream item type is not a Result, so we can't yield an Err.
+                // For now, the stream will just end prematurely.
+                // A better solution might involve changing the stream's item type to a Result.
+                return;
+            }
+
             if self.active_tx.is_some() {
                 // --- Explicit Transaction Path with RYOW ---
                 // Note: This is not a true stream as it buffers results to handle RYOW.
                 // A true streaming implementation would require a complex merge iterator.
-                let results = self.range(start, end);
+                let results = self.range(start, end).unwrap(); // Assume ok for now
                 for item in results {
                     yield item;
                 }
@@ -856,6 +921,7 @@ where
     ///
     /// Returns an error if a transaction is already active on this handle.
     pub fn begin(&mut self) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
         if self.active_tx.is_some() {
             return Err(FluxError::TransactionAlreadyActive);
         }
@@ -873,6 +939,7 @@ where
     ///
     /// Returns an error if no transaction is active.
     pub async fn commit(&mut self) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
         let active_tx = self
             .active_tx
             .take()
@@ -917,7 +984,9 @@ where
 
         match tx_manager.commit(&active_tx, on_pre_commit) {
             Ok(()) => {
-                self.db.evict_if_needed().await;
+                // For explicit transactions, we don't spare any specific key,
+                // as multiple keys could have been inserted.
+                self.db.evict_if_needed(None).await;
                 Ok(())
             }
             Err(e) => {
@@ -932,6 +1001,7 @@ where
     /// This will discard all changes made within the transaction.
     /// Returns an error if no transaction is active.
     pub fn rollback(&mut self) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
         let active_tx = self
             .active_tx
             .take()
@@ -966,13 +1036,13 @@ where
     ///
     /// let result = handle.transaction(|h| Box::pin(async move {
     ///     h.insert("key1".to_string(), 100).await?;
-    ///     let val = h.get(&"key1".to_string()).unwrap();
+    ///     let val = h.get(&"key1".to_string()).unwrap().unwrap();
     ///     assert_eq!(*val, 100); // Read-Your-Own-Writes
     ///     Ok::<_, FluxError>("Success!")
     /// })).await?;
     ///
     /// assert_eq!(result, "Success!");
-    /// assert_eq!(*handle.get(&"key1".to_string()).unwrap(), 100);
+    /// assert_eq!(*handle.get(&"key1".to_string()).unwrap().unwrap(), 100);
     /// # Ok(())
     /// # }
     /// ```
@@ -981,6 +1051,7 @@ where
         F: for<'a> FnOnce(&'a mut Self) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>,
         E: From<FluxError>,
     {
+        self.check_fatal_error()?;
         self.begin()?;
 
         let result = f(self).await;
@@ -1009,7 +1080,8 @@ where
     /// This operation is performed within the handle's active transaction if one exists,
     /// or in a new, short-lived transaction if not. All keys returned are added to the
     /// transaction's read set. This method respects Read-Your-Own-Writes (RYOW).
-    pub fn prefix_scan(&self, prefix: &str) -> Vec<(K, Arc<V>)> {
+    pub fn prefix_scan(&self, prefix: &str) -> Result<Vec<(K, Arc<V>)>, FluxError> {
+        self.check_fatal_error()?;
         if let Some(active_tx) = &self.active_tx {
             // --- Explicit Transaction Path with RYOW ---
             active_tx
@@ -1041,14 +1113,14 @@ where
                     }
                 }
             }
-            results.into_iter().collect()
+            Ok(results.into_iter().collect())
         } else {
             // --- Autocommit Path ---
             let tx_manager = self.skiplist.transaction_manager();
             let tx = tx_manager.begin();
             let results = self.skiplist.prefix_scan(prefix, &tx);
             tx_manager.commit(&tx, || Ok(())).unwrap();
-            results
+            Ok(results)
         }
     }
 
@@ -1066,10 +1138,15 @@ where
         prefix: &'a str,
     ) -> impl futures::stream::Stream<Item = (K, Arc<V>)> + 'a {
         async_stream::stream! {
+            if self.check_fatal_error().is_err() {
+                // See note in range_stream.
+                return;
+            }
+
             if self.active_tx.is_some() {
                 // --- Explicit Transaction Path with RYOW ---
                 // Note: This is not a true stream as it buffers results to handle RYOW.
-                let results = self.prefix_scan(prefix);
+                let results = self.prefix_scan(prefix).unwrap();
                 for item in results {
                     yield item;
                 }

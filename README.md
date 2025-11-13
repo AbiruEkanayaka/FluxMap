@@ -22,7 +22,7 @@ It is designed for ease of use, high performance, and seamless integration into 
         -   `Full`: (fsync-per-transaction) Commits are flushed to disk before acknowledging, ensuring maximum safety.
 -   **Configurable Maintenance:**
     -   **Automatic Vacuuming:** Optional background thread to automatically clean up old data versions and reclaim memory.
-    -   **Memory Limiting:** Optional memory limit with LRU-based eviction to keep memory usage in check.
+    -   **Memory Limiting:** Optional memory limit with configurable eviction policies (LRU, LFU, Random, ARC) to keep memory usage in check.
 -   **High Performance:** A lock-free skiplist implementation provides excellent performance for reads and low-contention writes.
 -   **Ergonomic API:** A clean and simple API for `get`, `insert`, and `remove` operations. Supports both simple autocommit operations and explicit, multi-statement transactions.
 -   **Range & Prefix Scans:** Efficiently query ranges of keys or keys with a specific prefix, with both `Vec` and `Stream`-based APIs.
@@ -33,7 +33,7 @@ First, add FluxMap to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-fluxmap = "0.3.3"
+fluxmap = "0.3.4"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -57,7 +57,7 @@ async fn main() {
     handle.insert("hello".to_string(), "world".to_string()).await.unwrap();
 
     // Retrieve the value.
-    let value = handle.get(&"hello".to_string()).unwrap();
+    let value = handle.get(&"hello".to_string()).unwrap().unwrap();
     println!("Value: {}", *value);
 
     assert_eq!(*value, "world");
@@ -98,8 +98,8 @@ async fn main() -> Result<(), AppError> {
 
     // Atomically transfer 20 from Alice to Bob
     let result = handle.transaction(|h| Box::pin(async move {
-        let alice_balance = h.get(&"alice".to_string()).unwrap();
-        let bob_balance = h.get(&"bob".to_string()).unwrap();
+        let alice_balance = h.get(&"alice".to_string()).unwrap().unwrap();
+        let bob_balance = h.get(&"bob".to_string()).unwrap().unwrap();
 
         if *alice_balance >= 20 {
             h.insert("alice".to_string(), *alice_balance - 20).await?;
@@ -119,8 +119,8 @@ async fn main() -> Result<(), AppError> {
     }
 
     // Verify the final state
-    let final_alice = handle.get(&"alice".to_string()).unwrap();
-    let final_bob = handle.get(&"bob".to_string()).unwrap();
+    let final_alice = handle.get(&"alice".to_string()).unwrap().unwrap();
+    let final_bob = handle.get(&"bob".to_string()).unwrap().unwrap();
 
     println!("Final balances: Alice = {}, Bob = {}", *final_alice, *final_bob);
     assert_eq!(*final_alice, 80);
@@ -174,7 +174,7 @@ async fn main() {
     let recovered_handle = recovered_db.handle();
 
     // The data is still there!
-    let value = recovered_handle.get(&"persistent_key".to_string()).unwrap();
+    let value = recovered_handle.get(&"persistent_key".to_string()).unwrap().unwrap();
     println!("Recovered value: {}", *value);
     assert_eq!(*value, 123);
 }
@@ -198,7 +198,7 @@ async fn main() {
     handle.insert("item:a".to_string(), 99).await.unwrap();
 
     // Find all keys starting with "user:"
-    let user_keys = handle.prefix_scan("user:");
+    let user_keys = handle.prefix_scan("user:").unwrap();
     assert_eq!(user_keys.len(), 2);
     println!("Found users: {:?}", user_keys);
 }
@@ -235,7 +235,7 @@ async fn main() {
     let db: Arc<Database<String, String>> = Arc::new(
         Database::builder()
             .max_memory(500)
-            // You can also choose .eviction_policy(fluxmap::mem::EvictionPolicy::Lfu)
+            // You can also choose other policies, e.g., .eviction_policy(fluxmap::mem::EvictionPolicy::Lfu)
             .build()
             .await
             .unwrap(),
@@ -249,15 +249,15 @@ async fn main() {
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     // Access key1 to make it the most recently used
-    let _ = handle.get(&"key1".to_string());
+    let _ = handle.get(&"key1".to_string()).unwrap();
 
     // Insert another key, which should push memory usage over the limit.
     // This will trigger an eviction of the least recently used key ("key2").
     handle.insert("key3".to_string(), "a final long value".to_string()).await.unwrap();
 
     // "key2" should now be gone.
-    assert!(handle.get(&"key2".to_string()).is_none(), "key2 should be evicted");
-    assert!(handle.get(&"key1".to_string()).is_some(), "key1 should still exist");
+    assert!(handle.get(&"key2".to_string()).unwrap().is_none(), "key2 should be evicted");
+    assert!(handle.get(&"key1".to_string()).unwrap().is_some(), "key1 should still exist");
     println!("Eviction successful!");
 }
 ```
@@ -295,7 +295,7 @@ let db = Database::<String, String>::builder()
         interval: Duration::from_secs(30), // Run vacuum every 30 seconds
     })
     .max_memory(512 * 1024 * 1024) // Set a 512MB memory limit
-    .eviction_policy(fluxmap::mem::EvictionPolicy::Lfu) // Choose LFU eviction
+    .eviction_policy(fluxmap::mem::EvictionPolicy::Arc) // Choose ARC eviction
     .build()
     .await
     .unwrap();
@@ -332,8 +332,10 @@ When configured via `auto_vacuum` on the builder, the database will spawn a back
 
 You can configure a memory limit to prevent the database from growing indefinitely. When the estimated memory usage exceeds this limit, FluxMap will automatically evict keys to stay under the limit based on the configured `EvictionPolicy`.
 
--   **`Lru` (default):** Evicts the Least Recently Used item. This is a good general-purpose policy.
--   **`Lfu`:** Evicts the Least Frequently Used item. This is useful for workloads where a subset of items is accessed much more frequently than the rest.
+-   **`Lru` (default):** Evicts the Least Recently Used item. A good general-purpose policy.
+-   **`Lfu`:** Evicts the Least Frequently Used item. Useful for workloads where access frequency is more important than recency.
+-   **`Random`:** Evicts a random item. Can be effective for certain access patterns and avoids the overhead of tracking usage.
+-   **`Arc`:** Adaptive Replacement Cache. It intelligently balances between LRU and LFU, providing excellent performance across a wide variety of workloads.
 
 To use this feature, your key and value types must implement the `fluxmap::mem::MemSize` trait, which helps the database estimate how much memory each entry consumes.
 
@@ -382,4 +384,4 @@ Contributions are welcome! Please feel free to open an issue or submit a pull re
 
 ## License
 
-This project is licensed under the [MIT License](https://github.com/AbiruEkanayaka/FluxMap/blob/main/LICENSE).
+This project is licensed under the [MIT License](https://github.com/AbiruEkanayaka/FluxMap/blob/main/LICENSE).    
