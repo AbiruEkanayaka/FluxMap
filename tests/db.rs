@@ -1,6 +1,7 @@
 use fluxmap::db::Database;
 use fluxmap::error::FluxError;
 use fluxmap::persistence::PersistenceOptions;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -504,4 +505,78 @@ async fn test_phantom_read_prevention_for_prefix_scan() {
     let final_handle = db.handle();
     let final_b = final_handle.get(&"user:jane".to_string()).unwrap().unwrap();
     assert_eq!(*final_b, 200); // from tx2
+}
+
+#[tokio::test]
+async fn test_transactional_range_stream_merge() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+    let handle = db.handle();
+
+    // Setup initial data
+    handle.insert("b".to_string(), 2).await.unwrap();
+    handle.insert("d".to_string(), 4).await.unwrap();
+    handle.insert("f".to_string(), 6).await.unwrap();
+
+    let mut tx_handle = db.handle();
+    tx_handle.begin().unwrap();
+
+    // Perform operations within the transaction
+    tx_handle.insert("c".to_string(), 30).await.unwrap(); // Insert
+    tx_handle.insert("d".to_string(), 40).await.unwrap(); // Update
+    tx_handle.remove(&"f".to_string()).await.unwrap(); // Delete
+    tx_handle.insert("z".to_string(), 99).await.unwrap(); // Insert outside range
+
+    // Stream the range and collect results
+    let start_key = "a".to_string();
+    let end_key = "e".to_string();
+    let stream = tx_handle.range_stream(&start_key, &end_key);
+    let results: Vec<(String, Arc<i32>)> = stream.map(|res| res.unwrap()).collect().await;
+
+    // Assertions
+    assert_eq!(results.len(), 3, "Should be 3 items in the merged stream");
+    assert_eq!(results[0].0, "b");
+    assert_eq!(*results[0].1, 2); // Unchanged from skiplist
+
+    assert_eq!(results[1].0, "c");
+    assert_eq!(*results[1].1, 30); // Inserted in workspace
+
+    assert_eq!(results[2].0, "d");
+    assert_eq!(*results[2].1, 40); // Updated in workspace
+
+    // "f" should be deleted and "z" should be out of range.
+}
+
+#[tokio::test]
+async fn test_transactional_prefix_scan_stream_merge() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+    let handle = db.handle();
+
+    // Setup initial data
+    handle.insert("user:bob".to_string(), 2).await.unwrap();
+    handle.insert("user:dave".to_string(), 4).await.unwrap();
+    handle.insert("item:a".to_string(), 99).await.unwrap();
+
+    let mut tx_handle = db.handle();
+    tx_handle.begin().unwrap();
+
+    // Perform operations within the transaction
+    tx_handle.insert("user:charlie".to_string(), 30).await.unwrap(); // Insert
+    tx_handle.insert("user:dave".to_string(), 40).await.unwrap(); // Update
+    tx_handle.remove(&"user:bob".to_string()).await.unwrap(); // Delete
+    tx_handle.insert("guest:a".to_string(), 101).await.unwrap(); // Insert outside prefix
+
+    // Stream the range and collect results
+    let stream = tx_handle.prefix_scan_stream("user:");
+    let results: Vec<(String, Arc<i32>)> = stream.map(|res| res.unwrap()).collect().await;
+
+    // Assertions
+    assert_eq!(results.len(), 2, "Should be 2 items in the merged stream");
+
+    assert_eq!(results[0].0, "user:charlie");
+    assert_eq!(*results[0].1, 30); // Inserted in workspace
+
+    assert_eq!(results[1].0, "user:dave");
+    assert_eq!(*results[1].1, 40); // Updated in workspace
+
+    // "user:bob" should be deleted. "item:a" and "guest:a" should be out of scope.
 }

@@ -1029,32 +1029,83 @@ where
     ///
     /// This operation is performed within the handle's active transaction if one exists,
     /// or in a new, short-lived transaction if not. All keys yielded by the stream are
-    /// added to the transaction's read set. This method respects Read-Your-Own-Writes (RYOW).
-    ///
-    /// **Note:** In an explicit transaction, this method currently buffers all results
-    /// internally to correctly merge changes from the transaction's workspace. It does
-    /// not provide true end-to-end streaming in that case.
+    /// added to the transaction's read set. This method respects Read-Your-Own-Writes (RYOW)
+    /// by merging changes from the transaction's workspace on-the-fly.
     pub fn range_stream<'a>(
         &'a self,
         start: &'a K,
         end: &'a K,
-    ) -> impl futures::stream::Stream<Item = (K, Arc<V>)> + 'a {
+    ) -> impl futures::stream::Stream<Item = Result<(K, Arc<V>), FluxError>> + 'a {
         async_stream::stream! {
-            if self.check_fatal_error().is_err() {
-                // How to yield an error from an async_stream?
-                // The stream item type is not a Result, so we can't yield an Err.
-                // For now, the stream will just end prematurely.
-                // A better solution might involve changing the stream's item type to a Result.
+            if let Err(e) = self.check_fatal_error() {
+                yield Err(e);
                 return;
             }
 
-            if self.active_tx.is_some() {
-                // --- Explicit Transaction Path with RYOW ---
-                // Note: This is not a true stream as it buffers results to handle RYOW.
-                // A true streaming implementation would require a complex merge iterator.
-                let results = self.range(start, end).unwrap(); // Assume ok for now
-                for item in results {
-                    yield item;
+            if let Some(active_tx) = &self.active_tx {
+                // --- Explicit Transaction Path with RYOW (True Streaming Merge) ---
+                active_tx
+                    .range_scans
+                    .write()
+                    .unwrap()
+                    .push((start.clone(), end.clone()));
+
+                let skiplist_stream = self.skiplist.range_stream(start, end, active_tx).peekable();
+                futures::pin_mut!(skiplist_stream);
+
+                // Prepare sorted workspace items within the range
+                let workspace = active_tx.workspace.read().unwrap();
+                let mut workspace_items: BTreeMap<K, Option<Arc<V>>> = workspace
+                    .iter()
+                    .filter(|(k, _)| *k >= start && *k <= end)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                loop {
+                    let skiplist_peek = skiplist_stream.as_mut().peek().await;
+
+                    match skiplist_peek {
+                        Some((skiplist_key, _)) => {
+                            let workspace_key = workspace_items.keys().next().cloned();
+
+                            if let Some(wk) = workspace_key {
+                                if skiplist_key < &wk {
+                                    // Skiplist item is smaller, yield it.
+                                    let (key, value) = skiplist_stream.as_mut().next().await.unwrap();
+                                    yield Ok((key, value));
+                                } else if skiplist_key > &wk {
+                                    // Workspace item is smaller, yield it (if not a delete).
+                                    let (key, value_opt) = workspace_items.pop_first().unwrap();
+                                    if let Some(value) = value_opt {
+                                        yield Ok((key, value));
+                                    }
+                                } else { // Keys are equal
+                                    // Workspace overrides. Yield workspace item (if not a delete).
+                                    let (key, value_opt) = workspace_items.pop_first().unwrap();
+                                    if let Some(value) = value_opt {
+                                        yield Ok((key, value));
+                                    }
+                                    // And advance the skiplist stream, discarding its value.
+                                    let _ = skiplist_stream.as_mut().next().await;
+                                }
+                            } else {
+                                // Workspace is empty, drain the rest of the skiplist stream.
+                                while let Some((key, value)) = skiplist_stream.as_mut().next().await {
+                                    yield Ok((key, value));
+                                }
+                                break;
+                            }
+                        }
+                        None => {
+                            // Skiplist stream is empty, drain the rest of the workspace.
+                            for (key, value_opt) in workspace_items {
+                                if let Some(value) = value_opt {
+                                    yield Ok((key, value));
+                                }
+                            }
+                            break;
+                        }
+                    }
                 }
             } else {
                 // --- Autocommit Path (can be a true stream) ---
@@ -1063,7 +1114,7 @@ where
                 let stream = self.skiplist.range_stream(start, end, &tx);
                 futures::pin_mut!(stream);
                 while let Some(item) = stream.next().await {
-                    yield item;
+                    yield Ok(item);
                 }
                 tx_manager.commit(&tx, || Ok(())).unwrap();
             }
@@ -1284,27 +1335,82 @@ where
     ///
     /// This operation is performed within the handle's active transaction if one exists,
     /// or in a new, short-lived transaction if not. All keys yielded by the stream are
-    /// added to the transaction's read set. This method respects Read-Your-Own-Writes (RYOW).
-    ///
-    /// **Note:** In an explicit transaction, this method currently buffers all results
-    /// internally to correctly merge changes from the transaction's workspace. It does
-    /// not provide true end-to-end streaming in that case.
+    /// added to the transaction's read set. This method respects Read-Your-Own-Writes (RYOW)
+    /// by merging changes from the transaction's workspace on-the-fly.
     pub fn prefix_scan_stream<'a>(
         &'a self,
         prefix: &'a str,
-    ) -> impl futures::stream::Stream<Item = (K, Arc<V>)> + 'a {
+    ) -> impl futures::stream::Stream<Item = Result<(K, Arc<V>), FluxError>> + 'a {
         async_stream::stream! {
-            if self.check_fatal_error().is_err() {
-                // See note in range_stream.
+            if let Err(e) = self.check_fatal_error() {
+                yield Err(e);
                 return;
             }
 
-            if self.active_tx.is_some() {
-                // --- Explicit Transaction Path with RYOW ---
-                // Note: This is not a true stream as it buffers results to handle RYOW.
-                let results = self.prefix_scan(prefix).unwrap();
-                for item in results {
-                    yield item;
+            if let Some(active_tx) = &self.active_tx {
+                // --- Explicit Transaction Path with RYOW (True Streaming Merge) ---
+                active_tx
+                    .prefix_scans
+                    .write()
+                    .unwrap()
+                    .push(prefix.to_string());
+
+                let skiplist_stream = self.skiplist.prefix_scan_stream(prefix, active_tx).peekable();
+                futures::pin_mut!(skiplist_stream);
+
+                // Prepare sorted workspace items matching the prefix
+                let workspace = active_tx.workspace.read().unwrap();
+                let mut workspace_items: BTreeMap<K, Option<Arc<V>>> = workspace
+                    .iter()
+                    .filter(|(k, _)| <K as Borrow<str>>::borrow(k).starts_with(prefix))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                loop {
+                    let skiplist_peek = skiplist_stream.as_mut().peek().await;
+
+                    match skiplist_peek {
+                        Some((skiplist_key, _)) => {
+                            let workspace_key = workspace_items.keys().next().cloned();
+
+                            if let Some(wk) = workspace_key {
+                                if skiplist_key < &wk {
+                                    // Skiplist item is smaller, yield it.
+                                    let (key, value) = skiplist_stream.as_mut().next().await.unwrap();
+                                    yield Ok((key, value));
+                                } else if skiplist_key > &wk {
+                                    // Workspace item is smaller, yield it (if not a delete).
+                                    let (key, value_opt) = workspace_items.pop_first().unwrap();
+                                    if let Some(value) = value_opt {
+                                        yield Ok((key, value));
+                                    }
+                                } else { // Keys are equal
+                                    // Workspace overrides. Yield workspace item (if not a delete).
+                                    let (key, value_opt) = workspace_items.pop_first().unwrap();
+                                    if let Some(value) = value_opt {
+                                        yield Ok((key, value));
+                                    }
+                                    // And advance the skiplist stream, discarding its value.
+                                    let _ = skiplist_stream.as_mut().next().await;
+                                }
+                            } else {
+                                // Workspace is empty, drain the rest of the skiplist stream.
+                                while let Some((key, value)) = skiplist_stream.as_mut().next().await {
+                                    yield Ok((key, value));
+                                }
+                                break;
+                            }
+                        }
+                        None => {
+                            // Skiplist stream is empty, drain the rest of the workspace.
+                            for (key, value_opt) in workspace_items {
+                                if let Some(value) = value_opt {
+                                    yield Ok((key, value));
+                                }
+                            }
+                            break;
+                        }
+                    }
                 }
             } else {
                 // --- Autocommit Path (can be a true stream) ---
@@ -1313,7 +1419,7 @@ where
                 let stream = self.skiplist.prefix_scan_stream(prefix, &tx);
                 futures::pin_mut!(stream);
                 while let Some(item) = stream.next().await {
-                    yield item;
+                    yield Ok(item);
                 }
                 tx_manager.commit(&tx, || Ok(())).unwrap();
             }
