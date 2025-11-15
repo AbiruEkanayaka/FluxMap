@@ -485,10 +485,44 @@ where
 {
     /// Checks if memory usage exceeds the configured limit and evicts keys until it's under the limit.
     async fn evict_if_needed(&self, spare_key: Option<&K>) {
+        const EVICTION_BATCH_SIZE: usize = 10;
+
         if let Some(max_mem) = self.max_memory_bytes {
+            // Loop until memory is under the limit.
             while self.current_memory_bytes.load(Ordering::Relaxed) > max_mem {
-                if self.evict_one(spare_key).await.is_err() {
-                    // Could not find a victim or eviction failed, stop trying for now.
+                // For ARC, its state changes with each eviction, so we must evict one-by-one.
+                if self.eviction_policy == EvictionPolicy::Arc {
+                    if self.evict_one(spare_key).await.is_err() {
+                        break; // Stop if we can't find/evict a victim.
+                    }
+                    continue; // Continue the while loop to check memory again.
+                }
+
+                // For other policies, fetch a batch of candidates.
+                let victim_candidates = self.skiplist.find_victim_keys(
+                    self.eviction_policy,
+                    spare_key,
+                    EVICTION_BATCH_SIZE,
+                );
+
+                if victim_candidates.is_empty() {
+                    break; // No more victims can be found.
+                }
+
+                // Evict from the batch one by one until we are under the limit.
+                let mut evicted_in_batch = false;
+                for victim_key in victim_candidates {
+                    if self.skiplist.evict(&victim_key).is_some() {
+                        evicted_in_batch = true;
+                    }
+                    // After each eviction in the batch, check if we're done.
+                    if self.current_memory_bytes.load(Ordering::Relaxed) <= max_mem {
+                        break;
+                    }
+                }
+
+                // If we couldn't evict anything from the candidate batch, break to avoid an infinite loop.
+                if !evicted_in_batch {
                     break;
                 }
             }
@@ -500,8 +534,11 @@ where
         let victim_key = if let Some(manager) = &self.arc_manager {
             manager.lock().unwrap().find_victim()
         } else {
+            // Call the new batch method to get a single victim.
             self.skiplist
-                .find_victim_key(self.eviction_policy, spare_key)
+                .find_victim_keys(self.eviction_policy, spare_key, 1)
+                .into_iter()
+                .next()
         };
 
         if let Some(victim_key) = victim_key {

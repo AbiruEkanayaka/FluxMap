@@ -659,23 +659,29 @@ where
     }
 
     /// Dispatches to the appropriate victim-finding strategy based on the policy.
-    pub fn find_victim_key(&self, policy: EvictionPolicy, spare_key: Option<&K>) -> Option<K> {
+    pub fn find_victim_keys(
+        &self,
+        policy: EvictionPolicy,
+        spare_key: Option<&K>,
+        count: usize,
+    ) -> Vec<K> {
         match policy {
-            EvictionPolicy::Lru => self.find_lru_victim_key(spare_key),
-            EvictionPolicy::Lfu => self.find_lfu_victim_key(spare_key),
-            EvictionPolicy::Random => self.find_random_victim_key(spare_key),
+            EvictionPolicy::Lru => self.find_lru_victim_keys(spare_key, count),
+            EvictionPolicy::Lfu => self.find_lfu_victim_keys(spare_key, count),
+            EvictionPolicy::Random => self.find_random_victim_keys(spare_key, count),
             EvictionPolicy::Arc => {
-                unreachable!("ARC policy eviction should be handled by the Database module, not the SkipList.")
+                unreachable!(
+                    "ARC policy eviction should be handled by the Database module, not the SkipList."
+                )
             }
         }
     }
 
-    /// Finds a potential victim key for eviction using a random sampling strategy.
-    pub fn find_random_victim_key(&self, spare_key: Option<&K>) -> Option<K> {
-        const SAMPLE_SIZE: usize = 20;
+    /// Finds a batch of potential victim keys for eviction using a random sampling strategy.
+    pub fn find_random_victim_keys(&self, spare_key: Option<&K>, count: usize) -> Vec<K> {
         let guard = &crossbeam_epoch::pin();
 
-        let mut samples = Vec::with_capacity(SAMPLE_SIZE);
+        let mut samples = Vec::with_capacity(count);
         let mut current = self.head.load(Ordering::Relaxed, guard);
 
         // Skip the head node
@@ -691,11 +697,11 @@ where
                     continue;
                 }
 
-                if i < SAMPLE_SIZE {
+                if i < count {
                     samples.push(current);
                 } else {
                     let j = fastrand::usize(..=i);
-                    if j < SAMPLE_SIZE {
+                    if j < count {
                         samples[j] = current;
                     }
                 }
@@ -704,26 +710,20 @@ where
             current = node_ref.next[0].load(Ordering::Relaxed, guard);
         }
 
-        if samples.is_empty() {
-            return None;
-        }
-
-        // Pick a random node from the collected samples.
-        let random_index = fastrand::usize(..samples.len());
-        let random_node_shared = samples[random_index];
-
-        let random_node = unsafe { random_node_shared.as_ref().unwrap() };
-        random_node.key.clone()
+        samples
+            .into_iter()
+            .map(|node_ptr| unsafe { node_ptr.as_ref().unwrap().key.clone().unwrap() })
+            .collect()
     }
 
-    /// Finds a potential victim key for eviction using a random sampling LFU strategy.
+    /// Finds a batch of potential victim keys for eviction using a random sampling LFU strategy.
     ///
     /// Tie-breaking is done by LRU.
-    pub fn find_lfu_victim_key(&self, spare_key: Option<&K>) -> Option<K> {
-        const SAMPLE_SIZE: usize = 20;
+    pub fn find_lfu_victim_keys(&self, spare_key: Option<&K>, count: usize) -> Vec<K> {
+        let sample_size = (count * 5).max(20);
         let guard = &crossbeam_epoch::pin();
 
-        let mut samples = Vec::with_capacity(SAMPLE_SIZE);
+        let mut samples = Vec::with_capacity(sample_size);
         let mut current = self.head.load(Ordering::Relaxed, guard);
 
         // Skip the head node
@@ -739,11 +739,11 @@ where
                     continue;
                 }
 
-                if i < SAMPLE_SIZE {
+                if i < sample_size {
                     samples.push(current);
                 } else {
                     let j = fastrand::usize(..=i);
-                    if j < SAMPLE_SIZE {
+                    if j < sample_size {
                         samples[j] = current;
                     }
                 }
@@ -752,33 +752,29 @@ where
             current = node_ref.next[0].load(Ordering::Relaxed, guard);
         }
 
-        if samples.is_empty() {
-            return None;
-        }
+        // Sort the samples to find the best victims.
+        samples.sort_unstable_by_key(|&node_ptr| {
+            let node = unsafe { node_ptr.as_ref().unwrap() };
+            // Tuple of (count, timestamp) for tie-breaking
+            (
+                node.access_count.load(Ordering::Relaxed),
+                node.last_accessed.load(Ordering::Relaxed),
+            )
+        });
 
-        // Find the node with the lowest access count, using LRU as a tie-breaker.
-        let lfu_node_shared = samples
-            .iter()
-            .min_by_key(|&&node_ptr| {
-                let node = unsafe { node_ptr.as_ref().unwrap() };
-                // Tuple of (count, timestamp) for tie-breaking
-                (
-                    node.access_count.load(Ordering::Relaxed),
-                    node.last_accessed.load(Ordering::Relaxed),
-                )
-            })
-            .unwrap(); // Safe to unwrap as samples is not empty
-
-        let lfu_node = unsafe { lfu_node_shared.as_ref().unwrap() };
-        lfu_node.key.clone()
+        samples
+            .into_iter()
+            .take(count)
+            .map(|node_ptr| unsafe { node_ptr.as_ref().unwrap().key.clone().unwrap() })
+            .collect()
     }
 
-    /// Finds a potential victim key for eviction using a random sampling LRU strategy.
-    pub fn find_lru_victim_key(&self, spare_key: Option<&K>) -> Option<K> {
-        const SAMPLE_SIZE: usize = 20;
+    /// Finds a batch of potential victim keys for eviction using a random sampling LRU strategy.
+    pub fn find_lru_victim_keys(&self, spare_key: Option<&K>, count: usize) -> Vec<K> {
+        let sample_size = (count * 5).max(20);
         let guard = &crossbeam_epoch::pin();
 
-        let mut samples = Vec::with_capacity(SAMPLE_SIZE);
+        let mut samples = Vec::with_capacity(sample_size);
         let mut current = self.head.load(Ordering::Relaxed, guard);
 
         // Skip the head node
@@ -794,11 +790,11 @@ where
                     continue;
                 }
 
-                if i < SAMPLE_SIZE {
+                if i < sample_size {
                     samples.push(current);
                 } else {
                     let j = fastrand::usize(..=i);
-                    if j < SAMPLE_SIZE {
+                    if j < sample_size {
                         samples[j] = current;
                     }
                 }
@@ -807,21 +803,17 @@ where
             current = node_ref.next[0].load(Ordering::Relaxed, guard);
         }
 
-        if samples.is_empty() {
-            return None;
-        }
+        // Sort the samples to find the best victims.
+        samples.sort_unstable_by_key(|&node_ptr| {
+            let node = unsafe { node_ptr.as_ref().unwrap() };
+            node.last_accessed.load(Ordering::Relaxed)
+        });
 
-        // Find the node with the oldest (smallest) last_accessed timestamp
-        let lru_node_shared = samples
-            .iter()
-            .min_by_key(|&&node_ptr| {
-                let node = unsafe { node_ptr.as_ref().unwrap() };
-                node.last_accessed.load(Ordering::Relaxed)
-            })
-            .unwrap(); // Safe to unwrap as samples is not empty
-
-        let lru_node = unsafe { lru_node_shared.as_ref().unwrap() };
-        lru_node.key.clone()
+        samples
+            .into_iter()
+            .take(count)
+            .map(|node_ptr| unsafe { node_ptr.as_ref().unwrap().key.clone().unwrap() })
+            .collect()
     }
 
     /// Evicts a key, marks it as deleted, and returns the amount of memory freed.
