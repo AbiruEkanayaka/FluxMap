@@ -85,7 +85,29 @@ pub struct VacuumOptions {
     pub interval: Duration,
 }
 
+// --- Builder Typestates ---
+
+/// A marker trait for the states of the `DatabaseBuilder`.
+pub trait BuilderState {}
+
+/// The initial state of the builder. Can build an in-memory database or configure durability.
+#[derive(Debug, Default)]
+pub struct Initial;
+impl BuilderState for Initial {}
+
+/// State after `durability_relaxed` is called. Requires a flush condition to be buildable.
+#[derive(Debug, Default)]
+pub struct RelaxedDurability;
+impl BuilderState for RelaxedDurability {}
+
+/// A state where the configuration is valid and `build()` can be called.
+#[derive(Debug, Default)]
+pub struct Buildable;
+impl BuilderState for Buildable {}
+
 /// A builder for creating a [`Database`] instance with custom configurations.
+///
+/// It uses a typestate pattern to ensure valid configurations at compile time.
 ///
 /// # Examples
 /// ```
@@ -114,7 +136,7 @@ pub struct VacuumOptions {
 ///     .unwrap();
 /// # }
 /// ```
-pub struct DatabaseBuilder<K, V> {
+pub struct DatabaseBuilder<K, V, S: BuilderState = Initial> {
     vacuum: Option<VacuumOptions>,
     persistence_options: Option<PersistenceOptions>,
     is_full_durability: bool,
@@ -123,75 +145,11 @@ pub struct DatabaseBuilder<K, V> {
     flush_after_m_bytes: Option<u64>,
     max_memory_bytes: Option<u64>,
     eviction_policy: EvictionPolicy,
-    _phantom: PhantomData<(K, V)>,
+    _phantom: PhantomData<(K, V, S)>,
 }
 
-impl<K, V> Default for DatabaseBuilder<K, V> {
-    fn default() -> Self {
-        Self {
-            vacuum: None,
-            persistence_options: None,
-            is_full_durability: false,
-            flush_interval: None,
-            flush_after_n_commits: None,
-            flush_after_m_bytes: None,
-            max_memory_bytes: None,
-            eviction_policy: EvictionPolicy::default(),
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<K, V> DatabaseBuilder<K, V>
-where
-    K: Ord
-        + Clone
-        + Send
-        + Sync
-        + 'static
-        + Hash
-        + Eq
-        + Serialize
-        + for<'de> Deserialize<'de>
-        + MemSize
-        + Borrow<str>,
-    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
-{
-    /// Configures the database for full durability (`fsync` per transaction).
-    pub fn durability_full(mut self, options: PersistenceOptions) -> Self {
-        self.persistence_options = Some(options);
-        self.is_full_durability = true;
-        self
-    }
-
-    /// Configures the database for relaxed durability (group commit).
-    ///
-    /// You must chain this with at least one flush condition (`flush_interval`,
-    /// `flush_after_commits`, or `flush_after_bytes`).
-    pub fn durability_relaxed(mut self, options: PersistenceOptions) -> Self {
-        self.persistence_options = Some(options);
-        self.is_full_durability = false;
-        self
-    }
-
-    /// Sets the time-based flush condition for relaxed durability.
-    pub fn flush_interval(mut self, interval: Duration) -> Self {
-        self.flush_interval = Some(interval);
-        self
-    }
-
-    /// Sets the commit-based flush condition for relaxed durability.
-    pub fn flush_after_commits(mut self, n: usize) -> Self {
-        self.flush_after_n_commits = Some(n);
-        self
-    }
-
-    /// Sets the byte-based flush condition for relaxed durability.
-    pub fn flush_after_bytes(mut self, m: u64) -> Self {
-        self.flush_after_m_bytes = Some(m);
-        self
-    }
-
+/// Methods available on the builder in any state.
+impl<K, V, S: BuilderState> DatabaseBuilder<K, V, S> {
     /// Enables and configures automatic vacuuming.
     ///
     /// If not set, vacuuming must be performed manually by calling [`Database::vacuum`].
@@ -217,103 +175,231 @@ where
         self
     }
 
+    /// A helper function to transition the builder to a new state.
+    fn transition<NewState: BuilderState>(self) -> DatabaseBuilder<K, V, NewState> {
+        DatabaseBuilder {
+            vacuum: self.vacuum,
+            persistence_options: self.persistence_options,
+            is_full_durability: self.is_full_durability,
+            flush_interval: self.flush_interval,
+            flush_after_n_commits: self.flush_after_n_commits,
+            flush_after_m_bytes: self.flush_after_m_bytes,
+            max_memory_bytes: self.max_memory_bytes,
+            eviction_policy: self.eviction_policy,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// Methods available only on the initial builder state.
+impl<K, V> DatabaseBuilder<K, V, Initial>
+where
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + Hash
+        + Eq
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + MemSize
+        + Borrow<str>,
+    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
+{
+    /// Configures the database for full durability (`fsync` per transaction).
+    /// This makes the builder ready to build.
+    pub fn durability_full(mut self, options: PersistenceOptions) -> DatabaseBuilder<K, V, Buildable> {
+        self.persistence_options = Some(options);
+        self.is_full_durability = true;
+        self.transition()
+    }
+
+    /// Configures the database for relaxed durability (group commit).
+    ///
+    /// After calling this, you must chain it with at least one flush condition
+    /// (`flush_interval`, `flush_after_commits`, or `flush_after_bytes`)
+    /// before you can build.
+    pub fn durability_relaxed(
+        mut self,
+        options: PersistenceOptions,
+    ) -> DatabaseBuilder<K, V, RelaxedDurability> {
+        self.persistence_options = Some(options);
+        self.is_full_durability = false;
+        self.transition()
+    }
+
+    /// Builds an in-memory `Database` instance.
+    pub async fn build(self) -> Result<Database<K, V>, FluxError> {
+        build_internal(self, DurabilityLevel::InMemory).await
+    }
+}
+
+/// Methods available only when relaxed durability is configured but no flush condition is set.
+impl<K, V> DatabaseBuilder<K, V, RelaxedDurability> {
+    /// Sets the time-based flush condition for relaxed durability.
+    /// This makes the builder ready to build.
+    pub fn flush_interval(mut self, interval: Duration) -> DatabaseBuilder<K, V, Buildable> {
+        self.flush_interval = Some(interval);
+        self.transition()
+    }
+
+    /// Sets the commit-based flush condition for relaxed durability.
+    /// This makes the builder ready to build.
+    pub fn flush_after_commits(mut self, n: usize) -> DatabaseBuilder<K, V, Buildable> {
+        self.flush_after_n_commits = Some(n);
+        self.transition()
+    }
+
+    /// Sets the byte-based flush condition for relaxed durability.
+    /// This makes the builder ready to build.
+    pub fn flush_after_bytes(mut self, m: u64) -> DatabaseBuilder<K, V, Buildable> {
+        self.flush_after_m_bytes = Some(m);
+        self.transition()
+    }
+}
+
+/// Methods available on a fully configured, buildable builder.
+impl<K, V> DatabaseBuilder<K, V, Buildable>
+where
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + Hash
+        + Eq
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + MemSize
+        + Borrow<str>,
+    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
+{
+    /// Sets or adds a time-based flush condition for relaxed durability.
+    pub fn flush_interval(mut self, interval: Duration) -> Self {
+        self.flush_interval = Some(interval);
+        self
+    }
+
+    /// Sets or adds a commit-based flush condition for relaxed durability.
+    pub fn flush_after_commits(mut self, n: usize) -> Self {
+        self.flush_after_n_commits = Some(n);
+        self
+    }
+
+    /// Sets or adds a byte-based flush condition for relaxed durability.
+    pub fn flush_after_bytes(mut self, m: u64) -> Self {
+        self.flush_after_m_bytes = Some(m);
+        self
+    }
+
     /// Builds the `Database` instance with the specified configurations.
     pub async fn build(self) -> Result<Database<K, V>, FluxError> {
-        let fatal_error = Arc::new(Mutex::new(None));
+        let durability = if self.is_full_durability {
+            DurabilityLevel::Full {
+                options: self.persistence_options.clone().unwrap(), // Safe due to typestate
+            }
+        } else {
+            DurabilityLevel::Relaxed {
+                options: self.persistence_options.clone().unwrap(), // Safe due to typestate
+                flush_interval_ms: self.flush_interval.map(|d| d.as_millis() as u64),
+                flush_after_n_commits: self.flush_after_n_commits,
+                flush_after_m_bytes: self.flush_after_m_bytes,
+            }
+        };
+        build_internal(self, durability).await
+    }
+}
 
-        let durability = match self.persistence_options {
-            Some(options) => {
-                if self.is_full_durability {
-                    DurabilityLevel::Full { options }
-                } else {
-                    let flush_interval_ms = self.flush_interval.map(|d| d.as_millis() as u64);
-                    if flush_interval_ms.is_none()
-                        && self.flush_after_n_commits.is_none()
-                        && self.flush_after_m_bytes.is_none()
-                    {
-                        return Err(FluxError::Configuration("Relaxed durability mode requires at least one flush condition (interval, commits, or bytes).".to_string()));
+/// Internal build logic shared by all buildable states.
+async fn build_internal<K, V, S: BuilderState>(
+    builder: DatabaseBuilder<K, V, S>,
+    durability: DurabilityLevel,
+) -> Result<Database<K, V>, FluxError>
+where
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + Hash
+        + Eq
+        + Serialize
+        + for<'de> Deserialize<'de>
+        + MemSize
+        + Borrow<str>,
+    V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
+{
+    let fatal_error = Arc::new(Mutex::new(None));
+
+    let persistence_engine = PersistenceEngine::new(durability, fatal_error.clone())?.map(Arc::new);
+
+    let current_memory_bytes = Arc::new(AtomicU64::new(0));
+    let access_clock = Arc::new(AtomicU64::new(0));
+
+    let skiplist = if let Some(engine) = &persistence_engine {
+        Arc::new(
+            engine
+                .recover(current_memory_bytes.clone(), access_clock.clone())
+                .await?,
+        )
+    } else {
+        Arc::new(SkipList::new(
+            current_memory_bytes.clone(),
+            access_clock.clone(),
+        ))
+    };
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let vacuum_handle = if let Some(vacuum_opts) = builder.vacuum {
+        let skiplist_clone = skiplist.clone();
+        let shutdown_clone = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async move {
+                while !shutdown_clone.load(Ordering::Relaxed) {
+                    tokio::time::sleep(vacuum_opts.interval).await;
+                    if shutdown_clone.load(Ordering::Relaxed) {
+                        break;
                     }
-                    DurabilityLevel::Relaxed {
-                        options,
-                        flush_interval_ms,
-                        flush_after_n_commits: self.flush_after_n_commits,
-                        flush_after_m_bytes: self.flush_after_m_bytes,
+                    if let Err(e) = skiplist_clone.vacuum().await {
+                        error!("Automatic vacuuming failed: {:?}", e);
                     }
                 }
-            }
-            None => DurabilityLevel::InMemory,
-        };
-
-        let persistence_engine =
-            PersistenceEngine::new(durability, fatal_error.clone())?.map(Arc::new);
-
-        let current_memory_bytes = Arc::new(AtomicU64::new(0));
-        let access_clock = Arc::new(AtomicU64::new(0));
-
-        let skiplist = if let Some(engine) = &persistence_engine {
-            Arc::new(
-                engine
-                    .recover(current_memory_bytes.clone(), access_clock.clone())
-                    .await?,
-            )
-        } else {
-            Arc::new(SkipList::new(
-                current_memory_bytes.clone(),
-                access_clock.clone(),
-            ))
-        };
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let vacuum_handle = if let Some(vacuum_opts) = self.vacuum {
-            let skiplist_clone = skiplist.clone();
-            let shutdown_clone = shutdown.clone();
-            let handle = std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-
-                runtime.block_on(async move {
-                    while !shutdown_clone.load(Ordering::Relaxed) {
-                        tokio::time::sleep(vacuum_opts.interval).await;
-                        if shutdown_clone.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        if let Err(e) = skiplist_clone.vacuum().await {
-                            error!("Automatic vacuuming failed: {:?}", e);
-                        }
-                    }
-                });
             });
-            Some(handle)
-        } else {
-            None
-        };
+        });
+        Some(handle)
+    } else {
+        None
+    };
 
-        let arc_manager = if self.eviction_policy == EvictionPolicy::Arc {
-            if let Some(max_mem) = self.max_memory_bytes {
-                Some(Arc::new(Mutex::new(ArcManager::new(max_mem))))
-            } else {
-                return Err(FluxError::Configuration(
-                    "Arc eviction policy requires max_memory to be set.".to_string(),
-                ));
-            }
+    let arc_manager = if builder.eviction_policy == EvictionPolicy::Arc {
+        if let Some(max_mem) = builder.max_memory_bytes {
+            Some(Arc::new(Mutex::new(ArcManager::new(max_mem))))
         } else {
-            None
-        };
+            return Err(FluxError::Configuration(
+                "Arc eviction policy requires max_memory to be set.".to_string(),
+            ));
+        }
+    } else {
+        None
+    };
 
-        Ok(Database {
-            skiplist,
-            persistence_engine,
-            _vacuum_handle: vacuum_handle,
-            shutdown,
-            max_memory_bytes: self.max_memory_bytes,
-            current_memory_bytes,
-            eviction_policy: self.eviction_policy,
-            arc_manager,
-            fatal_error,
-        })
-    }
+    Ok(Database {
+        skiplist,
+        persistence_engine,
+        _vacuum_handle: vacuum_handle,
+        shutdown,
+        max_memory_bytes: builder.max_memory_bytes,
+        current_memory_bytes,
+        eviction_policy: builder.eviction_policy,
+        arc_manager,
+        fatal_error,
+    })
 }
 
 /// The central database object that owns the underlying data store.
@@ -433,8 +519,18 @@ where
     }
 
     /// Creates a new `DatabaseBuilder` to configure and build a `Database`.
-    pub fn builder() -> DatabaseBuilder<K, V> {
-        DatabaseBuilder::default()
+    pub fn builder() -> DatabaseBuilder<K, V, Initial> {
+        DatabaseBuilder {
+            vacuum: None,
+            persistence_options: None,
+            is_full_durability: false,
+            flush_interval: None,
+            flush_after_n_commits: None,
+            flush_after_m_bytes: None,
+            max_memory_bytes: None,
+            eviction_policy: EvictionPolicy::default(),
+            _phantom: PhantomData,
+        }
     }
 
     /// Creates a new, empty, in-memory `Database` with default settings.
@@ -447,32 +543,55 @@ where
     /// Creates a new `Database` with a specified durability level and default settings.
     ///
     /// For more configuration options, use [`Database::builder`].
-    pub async fn new(config: DurabilityLevel) -> Result<Self, FluxError> {
-        let builder = Database::builder();
-        let configured_builder = match config {
-            DurabilityLevel::InMemory => builder,
-            DurabilityLevel::Full { options } => builder.durability_full(options),
+    pub async fn new(config: DurabilityLevel) -> Result<Self, FluxError>
+    where
+        K: Ord
+            + Clone
+            + Send
+            + Sync
+            + 'static
+            + Hash
+            + Eq
+            + Serialize
+            + for<'de> Deserialize<'de>
+            + MemSize
+            + Borrow<str>,
+        V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
+    {
+        match config {
+            DurabilityLevel::InMemory => Database::builder().build().await,
+            DurabilityLevel::Full { options } => Database::builder().durability_full(options).build().await,
             DurabilityLevel::Relaxed {
                 options,
                 flush_interval_ms,
                 flush_after_n_commits,
                 flush_after_m_bytes,
             } => {
-                let mut relaxed_builder = builder.durability_relaxed(options);
+                let relaxed_builder = Database::builder().durability_relaxed(options);
+
                 if let Some(interval) = flush_interval_ms {
-                    relaxed_builder =
+                    let mut buildable =
                         relaxed_builder.flush_interval(Duration::from_millis(interval));
+                    if let Some(n) = flush_after_n_commits {
+                        buildable = buildable.flush_after_commits(n);
+                    }
+                    if let Some(m) = flush_after_m_bytes {
+                        buildable = buildable.flush_after_bytes(m);
+                    }
+                    buildable.build().await
+                } else if let Some(n) = flush_after_n_commits {
+                    let mut buildable = relaxed_builder.flush_after_commits(n);
+                    if let Some(m) = flush_after_m_bytes {
+                        buildable = buildable.flush_after_bytes(m);
+                    }
+                    buildable.build().await
+                } else if let Some(m) = flush_after_m_bytes {
+                    relaxed_builder.flush_after_bytes(m).build().await
+                } else {
+                    Err(FluxError::Configuration("Relaxed durability mode requires at least one flush condition (interval, commits, or bytes).".to_string()))
                 }
-                if let Some(n) = flush_after_n_commits {
-                    relaxed_builder = relaxed_builder.flush_after_commits(n);
-                }
-                if let Some(m) = flush_after_m_bytes {
-                    relaxed_builder = relaxed_builder.flush_after_bytes(m);
-                }
-                relaxed_builder
             }
-        };
-        configured_builder.build().await
+        }
     }
 
     /// Manually triggers the vacuum process to reclaim space from dead data versions.
