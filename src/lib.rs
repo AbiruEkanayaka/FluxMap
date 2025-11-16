@@ -149,6 +149,15 @@ where
         Self::with_max_level(DEFAULT_MAX_LEVEL, current_memory_bytes, access_clock)
     }
 
+    /// Creates a new, empty `SkipList` with a custom p-factor.
+    pub fn with_p(
+        p: f64,
+        current_memory_bytes: Arc<AtomicU64>,
+        access_clock: Arc<AtomicU64>,
+    ) -> Self {
+        Self::with_max_level_and_p(DEFAULT_MAX_LEVEL, p, current_memory_bytes, access_clock)
+    }
+
     /// Creates a new, empty `SkipList` with a specified max level.
     pub fn with_max_level(
         max_level: usize,

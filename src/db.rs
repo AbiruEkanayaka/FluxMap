@@ -163,6 +163,7 @@ pub struct DatabaseBuilder<K, V, S: BuilderState = Initial> {
     flush_after_m_bytes: Option<u64>,
     max_memory_bytes: Option<u64>,
     eviction_policy: EvictionPolicy,
+    p_factor: Option<f64>,
     _phantom: PhantomData<(K, V, S)>,
 }
 
@@ -187,9 +188,21 @@ impl<K, V, S: BuilderState> DatabaseBuilder<K, V, S> {
 
     /// Sets the memory eviction policy.
     ///
-    /// Defaults to `EvictionPolicy::Lru`.
+    /// Defaults to `EvictionPolicy::Manual`.
     pub fn eviction_policy(mut self, policy: EvictionPolicy) -> Self {
         self.eviction_policy = policy;
+        self
+    }
+
+    /// Sets the skiplist probability factor `p`.
+    ///
+    /// This value, between 0.0 and 1.0, determines the probability of a node
+    /// in the skiplist having a higher level. A higher `p` results in a taller
+    /// skiplist, which can speed up searches but uses more memory.
+    ///
+    /// Defaults to `0.5`.
+    pub fn skiplist_p(mut self, p: f64) -> Self {
+        self.p_factor = Some(p);
         self
     }
 
@@ -204,6 +217,7 @@ impl<K, V, S: BuilderState> DatabaseBuilder<K, V, S> {
             flush_after_m_bytes: self.flush_after_m_bytes,
             max_memory_bytes: self.max_memory_bytes,
             eviction_policy: self.eviction_policy,
+            p_factor: self.p_factor,
             _phantom: PhantomData,
         }
     }
@@ -348,6 +362,12 @@ where
         + Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
 {
+    if builder.eviction_policy != EvictionPolicy::Manual && builder.max_memory_bytes.is_none() {
+        return Err(FluxError::Configuration(
+            "An automatic eviction policy requires max_memory to be set.".to_string(),
+        ));
+    }
+
     let fatal_error = Arc::new(Mutex::new(None));
 
     let persistence_engine = PersistenceEngine::new(durability, fatal_error.clone())?.map(Arc::new);
@@ -358,14 +378,19 @@ where
     let skiplist = if let Some(engine) = &persistence_engine {
         Arc::new(
             engine
-                .recover(current_memory_bytes.clone(), access_clock.clone())
+                .recover(
+                    current_memory_bytes.clone(),
+                    access_clock.clone(),
+                    builder.p_factor,
+                )
                 .await?,
         )
     } else {
-        Arc::new(SkipList::new(
-            current_memory_bytes.clone(),
-            access_clock.clone(),
-        ))
+        let list = match builder.p_factor {
+            Some(p) => SkipList::with_p(p, current_memory_bytes.clone(), access_clock.clone()),
+            None => SkipList::new(current_memory_bytes.clone(), access_clock.clone()),
+        };
+        Arc::new(list)
     };
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -396,13 +421,9 @@ where
     };
 
     let arc_manager = if builder.eviction_policy == EvictionPolicy::Arc {
-        if let Some(max_mem) = builder.max_memory_bytes {
-            Some(Arc::new(Mutex::new(ArcManager::new(max_mem))))
-        } else {
-            return Err(FluxError::Configuration(
-                "Arc eviction policy requires max_memory to be set.".to_string(),
-            ));
-        }
+        // The check at the start of the function ensures this unwrap is safe.
+        let max_mem = builder.max_memory_bytes.unwrap();
+        Some(Arc::new(Mutex::new(ArcManager::new(max_mem))))
     } else {
         None
     };
@@ -587,6 +608,7 @@ where
             flush_after_m_bytes: None,
             max_memory_bytes: None,
             eviction_policy: EvictionPolicy::default(),
+            p_factor: None,
             _phantom: PhantomData,
         }
     }

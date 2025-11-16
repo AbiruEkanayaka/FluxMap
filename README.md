@@ -235,6 +235,7 @@ async fn main() {
     let db: Arc<Database<String, String>> = Arc::new(
         Database::builder()
             .max_memory(500)
+            .eviction_policy(fluxmap::mem::EvictionPolicy::Lru)
             // You can also choose other policies, e.g., .eviction_policy(fluxmap::mem::EvictionPolicy::Lfu)
             .build()
             .await

@@ -520,8 +520,12 @@ where
         &self,
         current_memory_bytes: Arc<AtomicU64>,
         access_clock: Arc<AtomicU64>,
+        p_factor: Option<f64>,
     ) -> Result<SkipList<K, V>, crate::error::FluxError> {
-        let skiplist = SkipList::new(current_memory_bytes, access_clock);
+        let skiplist = match p_factor {
+            Some(p) => SkipList::with_p(p, current_memory_bytes, access_clock),
+            None => SkipList::new(current_memory_bytes, access_clock),
+        };
         let tx_manager = skiplist.transaction_manager();
 
         // 1. Load snapshot

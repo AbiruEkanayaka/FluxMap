@@ -1,5 +1,6 @@
 use fluxmap::db::Database;
 use fluxmap::error::FluxError;
+
 use fluxmap::persistence::PersistenceOptions;
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -579,4 +580,45 @@ async fn test_transactional_prefix_scan_stream_merge() {
     assert_eq!(*results[1].1, 40); // Updated in workspace
 
     // "user:bob" should be deleted. "item:a" and "guest:a" should be out of scope.
+}
+
+#[tokio::test]
+async fn test_builder_requires_max_memory_for_auto_eviction() {
+    // Using Lru policy without max_memory should fail
+    let res_lru = Database::<String, String>::builder()
+        .eviction_policy(fluxmap::mem::EvictionPolicy::Lru)
+        .build()
+        .await;
+    assert!(res_lru.is_err());
+    assert_eq!(
+        res_lru.err().unwrap(),
+        FluxError::Configuration(
+            "An automatic eviction policy requires max_memory to be set.".to_string()
+        )
+    );
+
+    // Using Manual policy without max_memory should succeed
+    let res_manual = Database::<String, String>::builder()
+        .eviction_policy(fluxmap::mem::EvictionPolicy::Manual)
+        .build()
+        .await;
+    assert!(res_manual.is_ok());
+
+    // Using Lru policy with max_memory should succeed
+    let res_lru_ok = Database::<String, String>::builder()
+        .eviction_policy(fluxmap::mem::EvictionPolicy::Lru)
+        .max_memory(1024)
+        .build()
+        .await;
+    assert!(res_lru_ok.is_ok());
+}
+
+
+#[tokio::test]
+async fn test_builder_with_custom_p_factor() {
+    let db_res = Database::<String, String>::builder()
+        .skiplist_p(0.25)
+        .build()
+        .await;
+    assert!(db_res.is_ok());
 }

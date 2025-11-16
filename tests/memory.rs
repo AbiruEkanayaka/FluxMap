@@ -25,8 +25,14 @@ async fn test_eviction_on_memory_limit() {
     // i32 value: 4 bytes
     // Total is roughly 120 bytes.
     // Let's set a limit of 300 bytes, which should allow 2 keys but not 3.
-    let db: Arc<Database<String, i32>> =
-        Arc::new(Database::builder().max_memory(450).build().await.unwrap());
+    let db: Arc<Database<String, i32>> = Arc::new(
+        Database::builder()
+            .max_memory(450)
+            .eviction_policy(EvictionPolicy::Lru)
+            .build()
+            .await
+            .unwrap(),
+    );
 
     let handle = db.handle();
 

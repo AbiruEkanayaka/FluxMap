@@ -246,11 +246,65 @@ fn bench_transaction_latency(c: &mut Criterion) {
     group.finish();
 }
 
+/// --- Concurrent Updates Benchmark ---
+fn bench_concurrent_updates(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let db = Arc::new(
+        rt.block_on(Database::<String, u64>::builder().build())
+            .unwrap(),
+    );
+
+    // Pre-populate the database
+    rt.block_on(setup_db(&db));
+
+    let mut group = c.benchmark_group("Concurrent Updates (Insert)");
+    group.plot_config(PlotConfiguration::default().summary_scale(AxisScale::Logarithmic));
+
+    for &num_tasks in &[1, 2, 4, 8, 16, 32] {
+        let ops_per_task = 1000 / num_tasks;
+        group.throughput(Throughput::Elements((ops_per_task * num_tasks) as u64));
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(num_tasks),
+            &num_tasks,
+            |b, &tasks_count| {
+                b.to_async(&rt).iter(|| async {
+                    let db = db.clone();
+                    let barrier = Arc::new(Barrier::new(tasks_count));
+                    let mut handles = Vec::new();
+
+                    for i in 0..tasks_count {
+                        let db_clone = db.clone();
+                        let barrier_clone = barrier.clone();
+                        let handle = tokio::spawn(async move {
+                            let mut rng = StdRng::seed_from_u64(i as u64);
+                            barrier_clone.wait().await;
+                            let db_handle = db_clone.handle();
+                            for _ in 0..ops_per_task {
+                                let key = rng.random_range(0..DATASET_SIZE).to_string();
+                                let value = rng.next_u64();
+                                black_box(db_handle.insert(key, value).await.unwrap());
+                            }
+                        });
+                        handles.push(handle);
+                    }
+
+                    for handle in handles {
+                        handle.await.unwrap();
+                    }
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_concurrent_reads,
     bench_concurrent_writes,
     bench_concurrent_mixed,
-    bench_transaction_latency
+    bench_transaction_latency,
+    bench_concurrent_updates
 );
 criterion_main!(benches);
