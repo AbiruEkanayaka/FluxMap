@@ -117,12 +117,19 @@ where
                                 + version_node.version.value.mem_size();
                             self.current_memory_bytes
                                 .fetch_sub(version_size as u64, Ordering::Relaxed);
+
+                            let raw_ptr = version_head.as_raw() as *mut crate::VersionNode<Arc<V>>;
+                            let raw_ptr_addr = raw_ptr as usize;
+                            let allocator = self.version_node_allocator.clone();
                             unsafe {
-                                // SAFETY: `version_head` is a `Shared` pointer to a `VersionNode` that has been
-                                // successfully unlinked from the version chain via `compare_exchange`.
-                                // `defer_destroy` schedules its reclamation after the current epoch.
-                                guard.defer_destroy(version_head)
-                            };
+                                // SAFETY: `version_head` points to the unlinked node. We can now
+                                // schedule its destruction and memory reclamation.
+                                guard.defer(move || {
+                                    let raw_ptr = raw_ptr_addr as *mut crate::VersionNode<Arc<V>>;
+                                    std::ptr::drop_in_place(raw_ptr);
+                                    allocator.free(std::ptr::NonNull::new_unchecked(raw_ptr));
+                                });
+                            }
                             versions_removed += 1;
                             // Pointer has been swung, so we loop again on the same prev_version_ptr
                             continue;

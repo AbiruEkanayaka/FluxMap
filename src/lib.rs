@@ -14,28 +14,30 @@
 //! -   **MVCC:** When a value is updated, a new `VersionNode` is prepended to the
 //!     chain. When a value is deleted, the most recent `VersionNode` is marked as
 
-use std::borrow::Borrow;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-};
-
-use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
+use crate::mem::{EvictionPolicy, MemSize};
+pub use crate::transaction::{Snapshot, Transaction, TransactionManager, TxId, Version};
+use crossbeam_epoch::{Atomic, Guard, Shared};
 use crossbeam_utils::CachePadded;
 use dashmap::DashSet;
 use futures::stream::Stream;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::borrow::Borrow;
+use std::ptr::{self, NonNull};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    Arc,
+};
+pub use persistence::{DurabilityLevel, PersistenceEngine, PersistenceOptions};
 
+pub mod arc;
 pub mod db;
 pub mod error;
 pub mod mem;
 pub mod persistence;
+pub mod slab;
 pub mod transaction;
 pub mod vacuum;
-pub mod arc;
-use crate::mem::{EvictionPolicy, MemSize};
-pub use crate::transaction::{Snapshot, Transaction, TransactionManager, TxId, Version};
-pub use persistence::{DurabilityLevel, PersistenceEngine, PersistenceOptions};
+use crate::slab::SlabAllocator;
 
 const DEFAULT_MAX_LEVEL: usize = 32;
 const DEFAULT_P: f64 = 0.5;
@@ -47,11 +49,11 @@ struct VersionNode<V> {
 }
 
 impl<V> VersionNode<V> {
-    fn new(version: Version<V>) -> Owned<Self> {
-        Owned::new(Self {
+    fn new(version: Version<V>) -> Self {
+        Self {
             version,
             next: Atomic::null(),
-        })
+        }
     }
 }
 
@@ -74,8 +76,8 @@ struct Node<K, V> {
 
 impl<K, V> Node<K, V> {
     /// Creates a new head node for a skiplist.
-    fn head(max_level: usize) -> Owned<Self> {
-        Owned::new(Node {
+    fn head(max_level: usize) -> Self {
+        Node {
             key: None,
             value: Atomic::null(),
             next: (0..max_level).map(|_| Atomic::null()).collect(),
@@ -83,27 +85,25 @@ impl<K, V> Node<K, V> {
             deleted: AtomicBool::new(false),
             last_accessed: AtomicU64::new(0),
             access_count: AtomicU64::new(0),
-        })
+        }
     }
 
     /// Creates a new data node with a single version.
-    fn new(key: K, value: Arc<V>, level: usize, txid: TxId, access_time: u64) -> Owned<Self> {
-        let version = Version {
-            value,
-            creator_txid: txid,
-            expirer_txid: AtomicU64::new(0), // 0 means not expired.
-        };
-        let version_node = VersionNode::new(version);
-
-        Owned::new(Node {
+    fn new(
+        key: K,
+        level: usize,
+        access_time: u64,
+        version_node_ptr: Shared<'_, VersionNode<Arc<V>>>,
+    ) -> Self {
+        Node {
             key: Some(key),
-            value: Atomic::from(version_node),
+            value: Atomic::from(version_node_ptr),
             next: (0..level + 1).map(|_| Atomic::null()).collect(),
             prev: Atomic::null(), // Will be set during insertion
             deleted: AtomicBool::new(false),
             last_accessed: AtomicU64::new(access_time),
             access_count: AtomicU64::new(1),
-        })
+        }
     }
 }
 
@@ -121,6 +121,8 @@ pub struct SkipList<K: Eq + std::hash::Hash + MemSize, V: MemSize> {
     tx_manager: Arc<TransactionManager<K, V>>,
     current_memory_bytes: Arc<AtomicU64>,
     access_clock: Arc<AtomicU64>,
+    node_allocator: Arc<SlabAllocator<Node<K, V>>>,
+    version_node_allocator: Arc<SlabAllocator<VersionNode<Arc<V>>>>,
 }
 
 enum InsertAction {
@@ -163,7 +165,13 @@ where
         current_memory_bytes: Arc<AtomicU64>,
         access_clock: Arc<AtomicU64>,
     ) -> Self {
-        let head = Node::head(max_level);
+        let node_allocator = Arc::new(SlabAllocator::new());
+        let head_ptr = node_allocator.alloc().as_ptr();
+        unsafe {
+            ptr::write(head_ptr, Node::head(max_level));
+        }
+        let head = Shared::from(head_ptr as *const Node<K, V>);
+
         SkipList {
             head: CachePadded::new(Atomic::from(head)),
             max_level: CachePadded::new(max_level),
@@ -173,6 +181,8 @@ where
             tx_manager: Arc::new(TransactionManager::<K, V>::new()),
             current_memory_bytes,
             access_clock,
+            node_allocator,
+            version_node_allocator: Arc::new(SlabAllocator::new()),
         }
     }
 
@@ -282,12 +292,19 @@ where
                             }
 
                             self.len.fetch_sub(1, Ordering::Relaxed);
+                            let raw_ptr = next.as_raw() as *mut Node<K, V>;
+                            let raw_ptr_addr = raw_ptr as usize;
+                            let allocator = self.node_allocator.clone();
                             unsafe {
                                 // SAFETY: `next` points to the unlinked node. Since we have successfully
                                 // unlinked it, no other thread will be able to reach it through the skiplist.
                                 // We can now safely schedule its memory to be reclaimed by the epoch-based
                                 // garbage collector.
-                                guard.defer_destroy(next);
+                                guard.defer(move || {
+                                    let raw_ptr = raw_ptr_addr as *mut Node<K, V>;
+                                    ptr::drop_in_place(raw_ptr);
+                                    allocator.free(NonNull::new_unchecked(raw_ptr));
+                                });
                             }
                         }
                     }
@@ -548,8 +565,12 @@ where
                         self.current_memory_bytes
                             .fetch_add(version_size, Ordering::Relaxed);
 
-                        let new_version_node = VersionNode::new(new_version);
-                        let new_version_node_shared = new_version_node.into_shared(guard);
+                        let version_node_ptr = self.version_node_allocator.alloc().as_ptr();
+                        unsafe {
+                            ptr::write(version_node_ptr, VersionNode::new(new_version));
+                        }
+                        let new_version_node_shared =
+                            Shared::from(version_node_ptr as *const VersionNode<Arc<V>>);
 
                         loop {
                             let current_head_ptr = next_node.value.load(Ordering::Acquire, guard);
@@ -586,14 +607,31 @@ where
                         self.current_memory_bytes
                             .fetch_add(node_size, Ordering::Relaxed);
 
+                        // Create the first version for the new node.
+                        let version = Version {
+                            value: value.clone(),
+                            creator_txid: transaction.id,
+                            expirer_txid: AtomicU64::new(0),
+                        };
+                        let version_node_ptr = self.version_node_allocator.alloc().as_ptr();
+                        unsafe {
+                            ptr::write(version_node_ptr, VersionNode::new(version));
+                        }
+                        let version_node_shared =
+                            Shared::from(version_node_ptr as *const VersionNode<Arc<V>>);
+
+                        // Create the new node itself.
+                        let node_ptr = self.node_allocator.alloc().as_ptr();
                         let new_node = Node::new(
                             key.clone(),
-                            value.clone(),
                             new_level,
-                            transaction.id,
                             self.access_clock.fetch_add(1, Ordering::Relaxed),
+                            version_node_shared,
                         );
-                        let new_node_shared = new_node.into_shared(guard);
+                        unsafe {
+                            ptr::write(node_ptr, new_node);
+                        }
+                        let new_node_shared = Shared::from(node_ptr as *const Node<K, V>);
 
                         unsafe {
                             // SAFETY: `new_node_shared` is a valid `Shared` pointer. `deref()` is safe.
@@ -663,14 +701,31 @@ where
                     self.current_memory_bytes
                         .fetch_add(node_size, Ordering::Relaxed);
 
+                    // Create the first version for the new node.
+                    let version = Version {
+                        value: value.clone(),
+                        creator_txid: transaction.id,
+                        expirer_txid: AtomicU64::new(0),
+                    };
+                    let version_node_ptr = self.version_node_allocator.alloc().as_ptr();
+                    unsafe {
+                        ptr::write(version_node_ptr, VersionNode::new(version));
+                    }
+                    let version_node_shared =
+                        Shared::from(version_node_ptr as *const VersionNode<Arc<V>>);
+
+                    // Create the new node itself.
+                    let node_ptr = self.node_allocator.alloc().as_ptr();
                     let new_node = Node::new(
                         key.clone(),
-                        value.clone(),
                         new_level,
-                        transaction.id,
                         self.access_clock.fetch_add(1, Ordering::Relaxed),
+                        version_node_shared,
                     );
-                    let new_node_shared = new_node.into_shared(guard);
+                    unsafe {
+                        ptr::write(node_ptr, new_node);
+                    }
+                    let new_node_shared = Shared::from(node_ptr as *const Node<K, V>);
 
                     unsafe {
                         // SAFETY: `new_node_shared` is a valid `Shared` pointer. `deref()` is safe.
