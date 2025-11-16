@@ -85,6 +85,24 @@ pub struct VacuumOptions {
     pub interval: Duration,
 }
 
+/// Contains information about the database's memory usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryInfo {
+    /// The configured memory limit in bytes, if any.
+    pub max_bytes: Option<u64>,
+    /// The estimated current memory usage in bytes.
+    pub current_bytes: u64,
+}
+
+/// Contains metadata about a specific key in the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyMetadata<K> {
+    pub key: K,
+    pub last_accessed: u64,
+    pub access_count: u64,
+    pub size_bytes: u64,
+}
+
 // --- Builder Typestates ---
 
 /// A marker trait for the states of the `DatabaseBuilder`.
@@ -485,6 +503,9 @@ where
 {
     /// Checks if memory usage exceeds the configured limit and evicts keys until it's under the limit.
     async fn evict_if_needed(&self, spare_key: Option<&K>) {
+        if self.eviction_policy == EvictionPolicy::Manual {
+            return; // Manual policy means the user is responsible for eviction.
+        }
         const EVICTION_BATCH_SIZE: usize = 10;
 
         if let Some(max_mem) = self.max_memory_bytes {
@@ -642,6 +663,25 @@ where
         self.skiplist.vacuum().await
     }
 
+    /// Returns information about the database's current memory usage.
+    ///
+    /// # Examples
+    /// ```
+    /// # use fluxmap::db::Database;
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let db = Database::<String, String>::builder().max_memory(1024).build().await.unwrap();
+    /// let info = db.memory_info();
+    /// assert_eq!(info.max_bytes, Some(1024));
+    /// # }
+    /// ```
+    pub fn memory_info(&self) -> MemoryInfo {
+        MemoryInfo {
+            max_bytes: self.max_memory_bytes,
+            current_bytes: self.current_memory_bytes.load(Ordering::Relaxed),
+        }
+    }
+
     /// Creates a new `Handle` for interacting with the database.
     ///
     /// Handles are lightweight, single-threaded session objects. They are not
@@ -740,6 +780,39 @@ where
         + Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
 {
+    /// Manually evicts a key from the database.
+    ///
+    /// This is primarily useful when using an `EvictionPolicy::Manual` policy,
+    /// allowing the application to control eviction directly.
+    ///
+    /// Note that this performs a logical deletion. The memory will be reclaimed
+    /// by the next vacuum cycle. The database's internal memory counter is updated
+    /// immediately.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(true)` if the key was found and evicted, `Ok(false)` otherwise.
+    pub async fn evict(&self, key: &K) -> Result<bool, FluxError> {
+        self.check_fatal_error()?;
+        if self.db.skiplist.evict(key).is_some() {
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Returns a stream that yields metadata for every key in the database.
+    ///
+    /// This is intended for use with `EvictionPolicy::Manual`, allowing an application
+    /// to inspect key metadata (like access time, frequency, and size) to decide
+    /// which keys to evict.
+    ///
+    /// **Warning:** This scans the entire database and can be a slow operation on
+    /// large datasets.
+    pub fn scan_metadata<'a>(&'a self) -> impl futures::stream::Stream<Item = KeyMetadata<K>> + 'a {
+        self.skiplist.scan_metadata()
+    }
+
     /// Checks if a fatal error has occurred in a background thread.
     fn check_fatal_error(&self) -> Result<(), FluxError> {
         if let Some(err_msg) = self.fatal_error.lock().unwrap().as_ref() {
@@ -868,7 +941,16 @@ where
                             .unwrap()
                             .miss(key_for_eviction.clone(), allocated_size as usize);
                     }
-                    self.db.evict_if_needed(Some(&key_for_eviction)).await;
+
+                    if self.db.eviction_policy == EvictionPolicy::Manual {
+                        if let Some(max_mem) = self.db.max_memory_bytes {
+                            if self.db.current_memory_bytes.load(Ordering::Relaxed) > max_mem {
+                                return Err(FluxError::MemoryLimitExceeded);
+                            }
+                        }
+                    } else {
+                        self.db.evict_if_needed(Some(&key_for_eviction)).await;
+                    }
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -1193,7 +1275,15 @@ where
             Ok(()) => {
                 // For explicit transactions, we don't spare any specific key,
                 // as multiple keys could have been inserted.
-                self.db.evict_if_needed(None).await;
+                if self.db.eviction_policy == EvictionPolicy::Manual {
+                    if let Some(max_mem) = self.db.max_memory_bytes {
+                        if self.db.current_memory_bytes.load(Ordering::Relaxed) > max_mem {
+                            return Err(FluxError::MemoryLimitExceeded);
+                        }
+                    }
+                } else {
+                    self.db.evict_if_needed(None).await;
+                }
                 Ok(())
             }
             Err(e) => {

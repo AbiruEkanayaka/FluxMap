@@ -200,6 +200,23 @@ where
 
     /// Finds the predecessor node for a given key at a specific level.
     /// This function also helps with physical removal of logically deleted nodes it encounters.
+    /// Calculates the total memory size of a node and its entire version chain.
+    fn get_node_size_bytes(&self, node: &Node<K, V>, guard: &Guard) -> u64 {
+        let mut total_size = std::mem::size_of::<Node<K, V>>()
+            + (node.next.len() * std::mem::size_of::<Atomic<Node<K, V>>>());
+        if let Some(k) = &node.key {
+            total_size += k.mem_size();
+        }
+
+        let mut version_ptr = node.value.load(Ordering::Acquire, guard);
+        while let Some(version_node) = unsafe { version_ptr.as_ref() } {
+            total_size += std::mem::size_of::<VersionNode<Arc<V>>>();
+            total_size += version_node.version.value.mem_size();
+            version_ptr = version_node.next.load(Ordering::Acquire, guard);
+        }
+        total_size as u64
+    }
+
     fn find_predecessor_at_level<'guard, Q: ?Sized>(
         &self,
         key: &Q,
@@ -674,6 +691,9 @@ where
                     "ARC policy eviction should be handled by the Database module, not the SkipList."
                 )
             }
+            EvictionPolicy::Manual => {
+                unreachable!("Manual policy eviction is handled by the user, not the SkipList.")
+            }
         }
     }
 
@@ -834,25 +854,13 @@ where
                     return None; // Already deleted by another thread.
                 }
 
-                // Calculate the size of the node and all its versions.
-                let mut total_removed_size = std::mem::size_of::<Node<K, V>>()
-                    + (node.next.len() * std::mem::size_of::<Atomic<Node<K, V>>>());
-                if let Some(k) = &node.key {
-                    total_removed_size += k.mem_size();
-                }
-
-                let mut version_ptr = node.value.load(Ordering::Acquire, guard);
-                while let Some(version_node) = unsafe { version_ptr.as_ref() } {
-                    total_removed_size += std::mem::size_of::<VersionNode<Arc<V>>>();
-                    total_removed_size += version_node.version.value.mem_size();
-                    version_ptr = version_node.next.load(Ordering::Acquire, guard);
-                }
+                let total_removed_size = self.get_node_size_bytes(node, guard);
 
                 // Synchronously decrement the memory counter.
                 self.current_memory_bytes
-                    .fetch_sub(total_removed_size as u64, Ordering::Relaxed);
+                    .fetch_sub(total_removed_size, Ordering::Relaxed);
 
-                return Some(total_removed_size as u64);
+                return Some(total_removed_size);
             }
         }
         None
@@ -998,6 +1006,35 @@ where
     ///
     /// As part of the SSI protocol, this operation adds all yielded keys to the
     /// transaction's read set.
+    /// Returns a stream that yields metadata for every key in the database.
+    ///
+    /// This is intended for use with manual eviction policies, allowing an application
+    /// to inspect key metadata (like access time and frequency) to decide which keys to evict.
+    ///
+    /// Note: This scans the entire database and can be a slow operation on large datasets.
+    pub fn scan_metadata<'a>(&'a self) -> impl Stream<Item = crate::db::KeyMetadata<K>> + 'a {
+        async_stream::stream! {
+            let guard = &crossbeam_epoch::pin();
+            let mut current = self.head.load(Ordering::Relaxed, guard);
+            // Skip head
+            current = unsafe { current.deref().next[0].load(Ordering::Acquire, guard) };
+
+            while let Some(node_ref) = unsafe { current.as_ref() } {
+                if !node_ref.deleted.load(Ordering::Acquire) {
+                    if let Some(key) = node_ref.key.as_ref() {
+                        yield crate::db::KeyMetadata {
+                            key: key.clone(),
+                            last_accessed: node_ref.last_accessed.load(Ordering::Relaxed),
+                            access_count: node_ref.access_count.load(Ordering::Relaxed),
+                            size_bytes: self.get_node_size_bytes(node_ref, guard),
+                        };
+                    }
+                }
+                current = node_ref.next[0].load(Ordering::Acquire, guard);
+            }
+        }
+    }
+
     pub fn range_stream<'a>(
         &'a self,
         start: &'a K,

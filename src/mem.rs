@@ -15,6 +15,8 @@ pub enum EvictionPolicy {
     Random,
     /// Adaptive Replacement Cache. Provides a good balance between LRU and LFU.
     Arc,
+    /// Manual eviction. The user is responsible for evicting keys when the memory limit is exceeded.
+    Manual,
 }
 
 /// A trait for types to report their memory usage, including heap-allocated data.

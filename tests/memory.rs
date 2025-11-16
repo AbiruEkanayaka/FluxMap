@@ -1,5 +1,7 @@
 use fluxmap::db::Database;
+use fluxmap::error::FluxError;
 use fluxmap::mem::{EvictionPolicy, MemSize};
+use futures::StreamExt;
 use std::sync::Arc;
 
 // A simple struct to test MemSize implementation.
@@ -215,4 +217,64 @@ async fn test_eviction_on_memory_limit_arc() {
         handle.get(&"key3".to_string()).unwrap().is_some(),
         "key3 should exist as it was just inserted"
     );
+}
+
+#[tokio::test]
+async fn test_manual_eviction_flow() {
+    let db: Arc<Database<String, i32>> = Arc::new(
+        Database::builder()
+            .max_memory(450) // Allows ~2 keys
+            .eviction_policy(EvictionPolicy::Manual)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let handle = db.handle();
+
+    // Insert two keys, should be fine.
+    handle.insert("key1".to_string(), 1).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    handle.insert("key2".to_string(), 2).await.unwrap();
+
+    // This insert should fail, asking for manual eviction.
+    let result = handle.insert("key3".to_string(), 3).await;
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), FluxError::MemoryLimitExceeded);
+
+    // Now, manually handle the eviction.
+    // We'll implement a simple LRU-style eviction manually.
+    let mut victims: Vec<fluxmap::db::KeyMetadata<String>> =
+        handle.scan_metadata().collect().await;
+    victims.sort_by_key(|v| v.last_accessed);
+
+    assert!(!victims.is_empty());
+    let victim_key = victims.first().unwrap().key.clone();
+
+    // Evict the victim.
+    let evicted = handle.evict(&victim_key).await.unwrap();
+    assert!(evicted);
+    assert_eq!(victim_key, "key1"); // "key1" should be the LRU
+
+    // Retry the insert. It should now succeed.
+    handle.insert("key3".to_string(), 3).await.unwrap();
+
+    // Verify final state
+    assert!(
+        handle.get(&"key1".to_string()).unwrap().is_none(),
+        "key1 should be evicted"
+    );
+    assert!(
+        handle.get(&"key2".to_string()).unwrap().is_some(),
+        "key2 should exist"
+    );
+    assert!(
+        handle.get(&"key3".to_string()).unwrap().is_some(),
+        "key3 should now exist"
+    );
+
+    // Check memory info
+    let info = db.memory_info();
+    assert_eq!(info.max_bytes, Some(450));
+    assert!(info.current_bytes <= info.max_bytes.unwrap());
 }
