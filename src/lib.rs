@@ -62,6 +62,8 @@ struct Node<K, V> {
     value: Atomic<VersionNode<Arc<V>>>,
     /// The forward pointers for each level of the skiplist.
     next: Vec<Atomic<Node<K, V>>>,
+    /// The backward pointer for the base level (level 0) of the skiplist.
+    prev: Atomic<Node<K, V>>,
     /// A flag indicating that this node is logically deleted and awaiting physical removal.
     deleted: AtomicBool,
     /// A timestamp indicating the last time this node was accessed, for LRU eviction.
@@ -77,6 +79,7 @@ impl<K, V> Node<K, V> {
             key: None,
             value: Atomic::null(),
             next: (0..max_level).map(|_| Atomic::null()).collect(),
+            prev: Atomic::null(), // Head's prev is null
             deleted: AtomicBool::new(false),
             last_accessed: AtomicU64::new(0),
             access_count: AtomicU64::new(0),
@@ -96,6 +99,7 @@ impl<K, V> Node<K, V> {
             key: Some(key),
             value: Atomic::from(version_node),
             next: (0..level + 1).map(|_| Atomic::null()).collect(),
+            prev: Atomic::null(), // Will be set during insertion
             deleted: AtomicBool::new(false),
             last_accessed: AtomicU64::new(access_time),
             access_count: AtomicU64::new(1),
@@ -260,10 +264,23 @@ where
                     }
                     .is_ok()
                     {
-                        // Physical removal was successful.
-                        // Only decrement len and schedule for destruction at the base level
-                        // to ensure it happens exactly once per node.
+                        // Physical removal of forward link was successful.
+                        // Now, update the backward link if we are at the base level.
                         if level == 0 {
+                            if let Some(non) = unsafe { next_of_next.as_ref() } {
+                                // Try to swing the prev pointer of the `next_of_next` node
+                                // from the deleted node to `current`.
+                                non.prev
+                                    .compare_exchange(
+                                        next,    /* expected old value: the deleted node */
+                                        current, /* new value: current node */
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                        guard,
+                                    )
+                                    .ok(); // We don't care if this fails, another thread might be helping.
+                            }
+
                             self.len.fetch_sub(1, Ordering::Relaxed);
                             unsafe {
                                 // SAFETY: `next` points to the unlinked node. Since we have successfully
@@ -583,6 +600,13 @@ where
                             // We are setting its level 0 forward pointer.
                             new_node_shared.deref().next[0].store(next, Ordering::Relaxed)
                         };
+                        // Set the back-pointer on the new node itself. This is always correct.
+                        unsafe {
+                            new_node_shared
+                                .deref()
+                                .prev
+                                .store(predecessor, Ordering::Relaxed)
+                        };
 
                         if unsafe {
                             // SAFETY: `predecessor` is a valid pointer. The `compare_exchange` is atomic
@@ -599,6 +623,24 @@ where
                         {
                             (InsertAction::YieldAndRetry, node_size) // Contention, retry whole operation.
                         } else {
+                            // Forward link is successful. Now try to fix the successor's back-pointer.
+                            if let Some(next_node) = unsafe { next.as_ref() } {
+                                // We expect the successor's prev to point to our predecessor.
+                                // We try to swing it to our new node.
+                                // If this fails, another thread was faster, which is okay.
+                                // The link will be fixed by a subsequent operation.
+                                next_node
+                                    .prev
+                                    .compare_exchange(
+                                        predecessor,
+                                        new_node_shared,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                        guard,
+                                    )
+                                    .ok();
+                            }
+
                             // Link the node at higher levels.
                             self.link_new_node(
                                 &key,
@@ -634,6 +676,13 @@ where
                         // SAFETY: `new_node_shared` is a valid `Shared` pointer. `deref()` is safe.
                         new_node_shared.deref().next[0].store(next, Ordering::Relaxed)
                     };
+                    // Set the back-pointer on the new node itself. This is always correct.
+                    unsafe {
+                        new_node_shared
+                            .deref()
+                            .prev
+                            .store(predecessor, Ordering::Relaxed)
+                    };
 
                     if unsafe {
                         // SAFETY: `predecessor` is a valid pointer. The `compare_exchange` is atomic.
@@ -649,6 +698,19 @@ where
                     {
                         (InsertAction::YieldAndRetry, node_size)
                     } else {
+                        // Forward link is successful. Now try to fix the successor's back-pointer.
+                        if let Some(next_node) = unsafe { next.as_ref() } {
+                            next_node
+                                .prev
+                                .compare_exchange(
+                                    predecessor,
+                                    new_node_shared,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                    guard,
+                                )
+                                .ok();
+                        }
                         self.link_new_node(&key, predecessors, new_node_shared, new_level, guard);
                         (InsertAction::Return, node_size)
                     }

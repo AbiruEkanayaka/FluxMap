@@ -58,7 +58,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
                             let db_handle = db_clone.handle();
                             for _ in 0..ops_per_task {
                                 let key = rng.random_range(0..DATASET_SIZE).to_string();
-                                black_box(db_handle.get(&key));
+                                let _ = black_box(db_handle.get(&key));
                             }
                         });
                         handles.push(handle);
@@ -158,7 +158,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
                                 let key = rng.random_range(0..DATASET_SIZE).to_string();
                                 if rng.random_ratio(80, 100) {
                                     // 80% reads
-                                    black_box(db_handle.get(&key));
+                                    let _ = black_box(db_handle.get(&key));
                                 } else {
                                     // 20% writes
                                     let value = rng.next_u64();
@@ -218,8 +218,8 @@ fn bench_transaction_latency(c: &mut Criterion) {
                                 let result = db_handle
                                     .transaction(|h| {
                                         Box::pin(async move {
-                                            let val1 = h.get(&"1".to_string()).unwrap();
-                                            let val2 = h.get(&"2".to_string()).unwrap();
+                                            let val1 = h.get(&"1".to_string()).unwrap().unwrap();
+                                            let val2 = h.get(&"2".to_string()).unwrap().unwrap();
                                             h.insert("1".to_string(), *val2).await?;
                                             h.insert("2".to_string(), *val1).await?;
                                             Ok::<_, fluxmap::error::FluxError>(())
