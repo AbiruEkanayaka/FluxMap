@@ -19,11 +19,13 @@ crossbeam-utils = "0.8"
 dashmap = "6.1.0"
 futures = "0.3"
 fastrand = "2"
-rustix = { version = "1.1.2", features = ["fs"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 ciborium = "0.2.2"
 log = "0.4.28"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.2", features = ["fs"] }
 
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["async_tokio"] }
@@ -32,4 +34,8 @@ tempfile = "3.10"
 
 [[bench]]
 name = "performance"
+harness = false
+
+[[bench]]
+name = "concurrent_quick_bench"
 harness = false

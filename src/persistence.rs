@@ -26,8 +26,6 @@ use crate::SkipList;
 use crate::mem::MemSize;
 use crate::transaction::Workspace;
 use log::error;
-use rustix::fs::FallocateFlags;
-use rustix::fs::fallocate;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -35,13 +33,15 @@ use std::io::{self, BufReader, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    mpsc,
+    mpsc, Arc, Condvar, Mutex,
 };
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::Notify;
+
+#[cfg(unix)]
+use rustix::fs::{fallocate, FallocateFlags};
 
 pub const WAL_SEGMENT_SIZE_BYTES: u64 = 1 * 1024 * 1024; // 1MB for easier testing
 
@@ -185,6 +185,29 @@ pub struct PersistenceEngine<K, V> {
     _phantom: PhantomData<(K, V)>,
 }
 
+/// Pre-allocates space for a file, using a platform-specific method.
+fn preallocate_file(file: &File, size: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        // On Unix, use fallocate for efficient space reservation.
+        fallocate(file, FallocateFlags::empty(), 0, size)?;
+    }
+    #[cfg(windows)]
+    {
+        // On Windows, set_len is the primary way to pre-allocate space.
+        // This may zero the file, which can be slower than fallocate.
+        file.set_len(size)?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // For other platforms, this is a no-op.
+        // The file will grow as it's written to.
+        let _ = file;
+        let _ = size;
+    }
+    Ok(())
+}
+
 fn setup_wal_files(options: &PersistenceOptions) -> io::Result<Vec<WalSegment>> {
     fs::create_dir_all(&options.wal_path)?;
     let mut wal_segments = Vec::with_capacity(options.wal_pool_size);
@@ -197,12 +220,7 @@ fn setup_wal_files(options: &PersistenceOptions) -> io::Result<Vec<WalSegment>> 
 
         // Pre-allocate space for the WAL segment to reduce fragmentation and
         // ensure space is available.
-        fallocate(
-            &file,
-            FallocateFlags::empty(),
-            0,
-            options.wal_segment_size_bytes,
-        )?;
+        preallocate_file(&file, options.wal_segment_size_bytes)?;
 
         let initial_state = if i == 0 {
             WalSegmentState::Writing

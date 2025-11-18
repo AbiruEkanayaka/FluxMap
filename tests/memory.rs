@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 // A simple struct to test MemSize implementation.
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 struct TestVal(String, u64);
 
 impl MemSize for TestVal {

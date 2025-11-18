@@ -105,7 +105,15 @@ fn bench_concurrent_writes(c: &mut Criterion) {
                             for _ in 0..ops_per_task {
                                 let key = rng.random_range(0..DATASET_SIZE).to_string();
                                 let value = rng.next_u64();
-                                black_box(db_handle.insert(key, value).await.unwrap());
+                                loop {
+                                    match db_handle.insert(key.clone(), value).await {
+                                        Ok(_) => break,
+                                        Err(fluxmap::error::FluxError::SerializationConflict) => {
+                                            tokio::task::yield_now().await;
+                                        }
+                                        Err(e) => panic!("Unexpected error during insert: {:?}", e),
+                                    }
+                                }
                             }
                         });
                         handles.push(handle);
@@ -162,7 +170,15 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
                                 } else {
                                     // 20% writes
                                     let value = rng.next_u64();
-                                    black_box(db_handle.insert(key, value).await.unwrap());
+                                    loop {
+                                        match db_handle.insert(key.clone(), value).await {
+                                            Ok(_) => break,
+                                            Err(fluxmap::error::FluxError::SerializationConflict) => {
+                                                tokio::task::yield_now().await;
+                                            }
+                                            Err(e) => panic!("Unexpected error during insert: {:?}", e),
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -231,6 +247,7 @@ fn bench_transaction_latency(c: &mut Criterion) {
                                     break;
                                 }
                                 // If a serialization conflict occurs, the loop will retry.
+                                tokio::task::yield_now().await;
                             }
                         });
                         handles.push(handle);
@@ -283,7 +300,15 @@ fn bench_concurrent_updates(c: &mut Criterion) {
                             for _ in 0..ops_per_task {
                                 let key = rng.random_range(0..DATASET_SIZE).to_string();
                                 let value = rng.next_u64();
-                                black_box(db_handle.insert(key, value).await.unwrap());
+                                loop {
+                                    match db_handle.insert(key.clone(), value).await {
+                                        Ok(_) => break,
+                                        Err(fluxmap::error::FluxError::SerializationConflict) => {
+                                            tokio::task::yield_now().await;
+                                        }
+                                        Err(e) => panic!("Unexpected error during insert: {:?}", e),
+                                    }
+                                }
                             }
                         });
                         handles.push(handle);
