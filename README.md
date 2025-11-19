@@ -325,6 +325,20 @@ You can control the trade-off between performance and safety by configuring dura
 -   **`Relaxed`**: (Group Commit) Commits are written to the OS buffer and a background thread flushes them to disk when the first of several conditions is met (e.g., time elapsed, number of commits, or bytes written). This offers high performance and durability against process crashes, but recent commits may be lost in case of an OS crash or power failure.
 -   **`Full`**: (fsync-per-transaction) Each transaction is fully synced to the disk before the `commit` call returns. This provides the strongest durability guarantee but has a higher performance overhead.
 
+### Durability Mechanism: WAL and Snapshots
+
+When a durability level other than `InMemory` is chosen, FluxMap uses a Write-Ahead Log (WAL) combined with periodic snapshotting to provide crash safety and manage disk space. This is a standard and robust technique used by many production databases.
+
+-   **WAL Segmentation:** Instead of a single, ever-growing log file, the WAL is split into a pool of smaller, fixed-size files called segments (e.g., `wal.0`, `wal.1`, etc.). The database writes to only one segment at a time.
+
+-   **Log Rotation:** When the active WAL segment becomes full, the engine performs a rotation: it marks the full segment as ready for processing and begins writing to the next available segment in the pool.
+
+-   **Background Snapshotting:** A dedicated background thread works to consolidate full WAL segments. It reads a segment, applies all the changes within it to an in-memory representation of the database, and then writes the entire, up-to-date dataset to a single `snapshot.db` file.
+
+-   **Space Reclamation:** Once a WAL segment has been successfully included in a new snapshot, it is no longer needed for recovery. The engine truncates the segment file, making it available for reuse. This crucial process prevents the WAL from growing indefinitely.
+
+-   **Fast Recovery:** When a durable database is started, it doesn't need to replay the entire history of all transactions. It simply loads the most recent snapshot into memory and then replays only the few WAL segments that were written *after* that snapshot was created. This makes the recovery process fast and efficient, even for databases that have been running for a long time.
+
 ### Automatic Vacuuming
 
 When configured via `auto_vacuum` on the builder, the database will spawn a background thread to periodically run the vacuum process. This reclaims memory from old, dead data versions. If not enabled, you can still call `db.vacuum()` manually.
