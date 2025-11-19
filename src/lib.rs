@@ -72,6 +72,8 @@ struct Node<K, V> {
     last_accessed: AtomicU64,
     /// The number of times this node has been accessed, for LFU eviction.
     access_count: AtomicU64,
+    /// A Unix timestamp indicating when this node was created or last updated, for TTL eviction.
+    last_modified: AtomicU64,
 }
 
 impl<K, V> Node<K, V> {
@@ -85,6 +87,7 @@ impl<K, V> Node<K, V> {
             deleted: AtomicBool::new(false),
             last_accessed: AtomicU64::new(0),
             access_count: AtomicU64::new(0),
+            last_modified: AtomicU64::new(0),
         }
     }
 
@@ -95,6 +98,10 @@ impl<K, V> Node<K, V> {
         access_time: u64,
         version_node_ptr: Shared<'_, VersionNode<Arc<V>>>,
     ) -> Self {
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         Node {
             key: Some(key),
             value: Atomic::from(version_node_ptr),
@@ -103,6 +110,7 @@ impl<K, V> Node<K, V> {
             deleted: AtomicBool::new(false),
             last_accessed: AtomicU64::new(access_time),
             access_count: AtomicU64::new(1),
+            last_modified: AtomicU64::new(now_ts),
         }
     }
 }
@@ -563,6 +571,13 @@ where
                             Ordering::Relaxed,
                         );
                         next_node.access_count.fetch_add(1, Ordering::Relaxed);
+                        next_node.last_modified.store(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            Ordering::Relaxed,
+                        );
 
                         let new_version = Version {
                             value: value.clone(),
@@ -812,6 +827,11 @@ where
             EvictionPolicy::Lru => self.find_lru_victim_keys(spare_key, count),
             EvictionPolicy::Lfu => self.find_lfu_victim_keys(spare_key, count),
             EvictionPolicy::Random => self.find_random_victim_keys(spare_key, count),
+            EvictionPolicy::Ttl => {
+                unreachable!(
+                    "TTL policy eviction should be handled by the Database module, not the SkipList."
+                )
+            }
             EvictionPolicy::Arc => {
                 unreachable!(
                     "ARC policy eviction should be handled by the Database module, not the SkipList."
@@ -960,6 +980,38 @@ where
             .take(count)
             .map(|node_ptr| unsafe { node_ptr.as_ref().unwrap().key.clone().unwrap() })
             .collect()
+    }
+
+    /// Finds a batch of victim keys that have expired based on their TTL.
+    pub fn find_ttl_victim_keys(&self, ttl: std::time::Duration, count: usize) -> Vec<K> {
+        let guard = &crossbeam_epoch::pin();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ttl_secs = ttl.as_secs();
+
+        let mut victims = Vec::new();
+        let mut current = self.head.load(Ordering::Relaxed, guard);
+
+        // Skip head node
+        current = unsafe { current.deref().next[0].load(Ordering::Relaxed, guard) };
+
+        while let Some(node_ref) = unsafe { current.as_ref() } {
+            if victims.len() >= count {
+                break;
+            }
+
+            if node_ref.key.is_some() && !node_ref.deleted.load(Ordering::Acquire) {
+                let last_modified = node_ref.last_modified.load(Ordering::Relaxed);
+                if now.saturating_sub(last_modified) > ttl_secs {
+                    victims.push(node_ref.key.as_ref().unwrap().clone());
+                }
+            }
+            current = node_ref.next[0].load(Ordering::Relaxed, guard);
+        }
+
+        victims
     }
 
     /// Evicts a key, marks it as deleted, and returns the amount of memory freed.

@@ -163,6 +163,7 @@ pub struct DatabaseBuilder<K, V, S: BuilderState = Initial> {
     flush_after_m_bytes: Option<u64>,
     max_memory_bytes: Option<u64>,
     eviction_policy: EvictionPolicy,
+    ttl: Option<Duration>,
     p_factor: Option<f64>,
     _phantom: PhantomData<(K, V, S)>,
 }
@@ -194,6 +195,12 @@ impl<K, V, S: BuilderState> DatabaseBuilder<K, V, S> {
         self
     }
 
+    /// Sets the time-to-live (TTL) for keys when using the TTL eviction policy.
+    pub fn eviction_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
     /// Sets the skiplist probability factor `p`.
     ///
     /// This value, between 0.0 and 1.0, determines the probability of a node
@@ -217,6 +224,7 @@ impl<K, V, S: BuilderState> DatabaseBuilder<K, V, S> {
             flush_after_m_bytes: self.flush_after_m_bytes,
             max_memory_bytes: self.max_memory_bytes,
             eviction_policy: self.eviction_policy,
+            ttl: self.ttl,
             p_factor: self.p_factor,
             _phantom: PhantomData,
         }
@@ -362,6 +370,13 @@ where
         + Borrow<str>,
     V: Clone + Send + Sync + 'static + Serialize + for<'de> Deserialize<'de> + MemSize,
 {
+    if builder.eviction_policy == EvictionPolicy::Ttl && builder.ttl.is_none() {
+        return Err(FluxError::Configuration(
+            "The TTL eviction policy requires a TTL duration to be set using .eviction_ttl()."
+                .to_string(),
+        ));
+    }
+
     if builder.eviction_policy != EvictionPolicy::Manual && builder.max_memory_bytes.is_none() {
         return Err(FluxError::Configuration(
             "An automatic eviction policy requires max_memory to be set.".to_string(),
@@ -436,6 +451,7 @@ where
         max_memory_bytes: builder.max_memory_bytes,
         current_memory_bytes,
         eviction_policy: builder.eviction_policy,
+        ttl: builder.ttl,
         arc_manager,
         fatal_error,
     })
@@ -476,6 +492,8 @@ where
     current_memory_bytes: Arc<AtomicU64>,
     /// The configured memory eviction policy.
     eviction_policy: EvictionPolicy,
+    /// The configured time-to-live for keys, if using the TTL policy.
+    ttl: Option<Duration>,
     /// The manager for the ARC eviction policy, if enabled.
     arc_manager: Option<Arc<ArcManager<K>>>,
     /// A container for a fatal error message from a background thread.
@@ -541,11 +559,16 @@ where
                 }
 
                 // For other policies, fetch a batch of candidates.
-                let victim_candidates = self.skiplist.find_victim_keys(
-                    self.eviction_policy,
-                    spare_key,
-                    EVICTION_BATCH_SIZE,
-                );
+                let victim_candidates = if self.eviction_policy == EvictionPolicy::Ttl {
+                    self.skiplist
+                        .find_ttl_victim_keys(self.ttl.unwrap(), EVICTION_BATCH_SIZE)
+                } else {
+                    self.skiplist.find_victim_keys(
+                        self.eviction_policy,
+                        spare_key,
+                        EVICTION_BATCH_SIZE,
+                    )
+                };
 
                 if victim_candidates.is_empty() {
                     break; // No more victims can be found.
@@ -608,6 +631,7 @@ where
             flush_after_m_bytes: None,
             max_memory_bytes: None,
             eviction_policy: EvictionPolicy::default(),
+            ttl: None,
             p_factor: None,
             _phantom: PhantomData,
         }

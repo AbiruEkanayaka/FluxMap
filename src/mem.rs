@@ -12,6 +12,8 @@ pub enum EvictionPolicy {
     Lfu,
     /// Evicts a random item. Good for workloads where access patterns are unpredictable.
     Random,
+    /// Evicts items that have exceeded their time-to-live (TTL).
+    Ttl,
     /// Adaptive Replacement Cache. Provides a good balance between LRU and LFU.
     Arc,
     /// Manual eviction. The user is responsible for evicting keys when the memory limit is exceeded.

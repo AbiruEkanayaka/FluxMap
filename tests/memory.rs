@@ -285,3 +285,52 @@ async fn test_manual_eviction_flow() {
     assert_eq!(info.max_bytes, Some(450));
     assert!(info.current_bytes <= info.max_bytes.unwrap());
 }
+
+#[tokio::test]
+async fn test_eviction_on_memory_limit_ttl() {
+    fastrand::seed(0);
+    // Set a memory limit that can hold roughly 2-3 items.
+    let ttl_duration = std::time::Duration::from_secs(2);
+    let db: Arc<Database<String, i32>> = Arc::new(
+        Database::builder()
+            .max_memory(450)
+            .eviction_policy(EvictionPolicy::Ttl)
+            .eviction_ttl(ttl_duration)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let handle = db.handle();
+
+    // Insert a key that will expire.
+    handle.insert("key_ephemeral".to_string(), 1).await.unwrap();
+
+    // Wait a bit, then insert a key that should not expire yet.
+    tokio::time::sleep(ttl_duration / 2).await;
+    handle.insert("key_permanent".to_string(), 2).await.unwrap();
+
+    // Wait for the ephemeral key to expire, but not the permanent one.
+    tokio::time::sleep(ttl_duration / 2 + std::time::Duration::from_millis(500)).await;
+
+    // At this point:
+    // "key_ephemeral" has been in the db for >2s. It IS expired.
+    // "key_permanent" has been in the db for <2s. It IS NOT expired.
+
+    // This insert should push memory over the limit and trigger an eviction.
+    // The TTL policy should find and evict "key_ephemeral".
+    handle.insert("key_trigger".to_string(), 3).await.unwrap();
+
+    // Verify that the expired key was evicted.
+    assert!(
+        handle.get(&"key_ephemeral".to_string()).unwrap().is_none(),
+        "key_ephemeral should have been evicted due to TTL"
+    );
+    assert!(
+        handle.get(&"key_permanent".to_string()).unwrap().is_some(),
+        "key_permanent should still exist"
+    );
+    assert!(
+        handle.get(&"key_trigger".to_string()).unwrap().is_some(),
+        "key_trigger should exist"
+    );
+}
