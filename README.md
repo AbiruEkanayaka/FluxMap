@@ -399,4 +399,4 @@ Contributions are welcome! Please feel free to open an issue or submit a pull re
 
 ## License
 
-This project is licensed under the [MIT License](https://github.com/AbiruEkanayaka/FluxMap/blob/main/LICENSE).    
+This project is licensed under the [MIT License](https://github.com/AbiruEkanayaka/FluxMap/blob/main/LICENSE).
