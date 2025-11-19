@@ -423,7 +423,7 @@ where
     let arc_manager = if builder.eviction_policy == EvictionPolicy::Arc {
         // The check at the start of the function ensures this unwrap is safe.
         let max_mem = builder.max_memory_bytes.unwrap();
-        Some(Arc::new(Mutex::new(ArcManager::new(max_mem))))
+        Some(Arc::new(ArcManager::new(max_mem)))
     } else {
         None
     };
@@ -477,7 +477,7 @@ where
     /// The configured memory eviction policy.
     eviction_policy: EvictionPolicy,
     /// The manager for the ARC eviction policy, if enabled.
-    arc_manager: Option<Arc<Mutex<ArcManager<K>>>>,
+    arc_manager: Option<Arc<ArcManager<K>>>,
     /// A container for a fatal error message from a background thread.
     fatal_error: Arc<Mutex<Option<String>>>,
 }
@@ -574,7 +574,7 @@ where
     /// Finds and evicts a single victim based on the configured eviction policy.
     async fn evict_one(&self, spare_key: Option<&K>) -> Result<(), FluxError> {
         let victim_key = if let Some(manager) = &self.arc_manager {
-            manager.lock().unwrap().find_victim()
+            manager.find_victim()
         } else {
             // Call the new batch method to get a single victim.
             self.skiplist
@@ -759,7 +759,7 @@ where
     #[cfg(not(test))]
     active_tx: Option<Arc<Transaction<K, V>>>,
     persistence_engine: &'db Option<Arc<PersistenceEngine<K, V>>>,
-    arc_manager: &'db Option<Arc<Mutex<ArcManager<K>>>>,
+    arc_manager: &'db Option<Arc<ArcManager<K>>>,
     fatal_error: &'db Arc<Mutex<Option<String>>>,
 }
 
@@ -885,7 +885,7 @@ where
             let tx = tx_manager.begin();
             let result = self.skiplist.get(key, &tx);
             if let (Some(manager), Some(_)) = (&self.arc_manager, &result) {
-                manager.lock().unwrap().hit(key);
+                manager.hit(key);
             }
             tx_manager.commit(&tx, || Ok(())).unwrap(); // Autocommit for reads cannot fail.
             Ok(result)
@@ -959,8 +959,6 @@ where
                 Ok(()) => {
                     if let Some(manager) = &self.arc_manager {
                         manager
-                            .lock()
-                            .unwrap()
                             .miss(key_for_eviction.clone(), allocated_size as usize);
                     }
 
