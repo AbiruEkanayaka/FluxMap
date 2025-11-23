@@ -173,10 +173,14 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
                                     loop {
                                         match db_handle.insert(key.clone(), value).await {
                                             Ok(_) => break,
-                                            Err(fluxmap::error::FluxError::SerializationConflict) => {
+                                            Err(
+                                                fluxmap::error::FluxError::SerializationConflict,
+                                            ) => {
                                                 tokio::task::yield_now().await;
                                             }
-                                            Err(e) => panic!("Unexpected error during insert: {:?}", e),
+                                            Err(e) => {
+                                                panic!("Unexpected error during insert: {:?}", e)
+                                            }
                                         }
                                     }
                                 }

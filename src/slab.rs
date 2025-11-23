@@ -9,11 +9,11 @@
 //! cold path (`grow`) to prevent a thundering herd problem when the allocator
 //! runs out of memory.
 
-use crossbeam_epoch::{pin, Atomic, Shared};
+use crossbeam_epoch::{Atomic, Shared, pin};
 use std::mem::{self, MaybeUninit};
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 const SLAB_SIZE: usize = 128; // Number of objects per slab
 

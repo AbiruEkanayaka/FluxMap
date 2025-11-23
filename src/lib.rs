@@ -20,14 +20,14 @@ use crossbeam_epoch::{Atomic, Guard, Shared};
 use crossbeam_utils::CachePadded;
 use dashmap::DashSet;
 use futures::stream::Stream;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+pub use persistence::{DurabilityLevel, PersistenceEngine, PersistenceOptions};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::borrow::Borrow;
 use std::ptr::{self, NonNull};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
-pub use persistence::{DurabilityLevel, PersistenceEngine, PersistenceOptions};
 
 pub mod arc;
 pub mod db;

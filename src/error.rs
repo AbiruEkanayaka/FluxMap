@@ -73,7 +73,11 @@ impl fmt::Display for FluxError {
             }
             FluxError::Configuration(e) => write!(f, "Configuration error: {}", e),
             FluxError::FatalPersistenceError(e) => {
-                write!(f, "Fatal persistence error: {}. The database is in a terminal state.", e)
+                write!(
+                    f,
+                    "Fatal persistence error: {}. The database is in a terminal state.",
+                    e
+                )
             }
         }
     }

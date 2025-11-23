@@ -33,15 +33,16 @@ use std::io::{self, BufReader, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::{
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    mpsc, Arc, Condvar, Mutex,
+    mpsc,
 };
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::Notify;
 
 #[cfg(unix)]
-use rustix::fs::{fallocate, FallocateFlags};
+use rustix::fs::{FallocateFlags, fallocate};
 
 pub const WAL_SEGMENT_SIZE_BYTES: u64 = 1 * 1024 * 1024; // 1MB for easier testing
 
@@ -337,7 +338,10 @@ where
                             }
                         },
                         Err(e) => {
-                            error!("Snapshotter: Failed to open existing snapshot file {:?}: {}", snapshot_path_clone, e);
+                            error!(
+                                "Snapshotter: Failed to open existing snapshot file {:?}: {}",
+                                snapshot_path_clone, e
+                            );
                             SnapshotData::default()
                         }
                     }

@@ -15,7 +15,7 @@
 //! This implementation is lock-free, using a concurrent doubly-linked list and
 //! concurrent hash maps to allow multiple threads to access it without blocking.
 
-use crossbeam_epoch::{pin, Atomic, Guard, Owned, Shared};
+use crossbeam_epoch::{Atomic, Guard, Owned, Shared, pin};
 use dashmap::DashMap;
 use std::fmt;
 use std::hash::Hash;
@@ -180,11 +180,8 @@ impl<K: Eq> LinkedList<K> {
     }
 
     /// Moves an existing node to the front of the list.
-    pub(crate) fn move_to_front<'guard>(
-        &self,
-        node: Shared<'guard, Node<K>>,
-        guard: &'guard Guard,
-    ) where
+    pub(crate) fn move_to_front<'guard>(&self, node: Shared<'guard, Node<K>>, guard: &'guard Guard)
+    where
         K: Clone,
     {
         if self.unlink(node, guard).is_ok() {
@@ -295,9 +292,18 @@ impl<K: Hash + Eq + Clone + 'static> ArcManager<K> {
             // Ghost hit on B1. Adapt p: Increase the target size of T1.
             let b1_len = self.b1.len() as u64;
             let b2_len = self.b2.len() as u64;
-            let delta = if b1_len == 0 { 0 } else if b1_len >= b2_len { 1 } else { b2_len / b1_len };
+            let delta = if b1_len == 0 {
+                0
+            } else if b1_len >= b2_len {
+                1
+            } else {
+                b2_len / b1_len
+            };
             let p = self.p.load(Ordering::Relaxed);
-            self.p.store(p.saturating_add(delta).min(self.capacity), Ordering::Relaxed);
+            self.p.store(
+                p.saturating_add(delta).min(self.capacity),
+                Ordering::Relaxed,
+            );
 
             // Move from ghost B1 to T2.
             let node_ptr = entry.1;
@@ -313,7 +319,13 @@ impl<K: Hash + Eq + Clone + 'static> ArcManager<K> {
             // Ghost hit on B2. Adapt p: Decrease the target size of T1.
             let b1_len = self.b1.len() as u64;
             let b2_len = self.b2.len() as u64;
-            let delta = if b2_len == 0 { 0 } else if b2_len >= b1_len { 1 } else { b1_len / b2_len };
+            let delta = if b2_len == 0 {
+                0
+            } else if b2_len >= b1_len {
+                1
+            } else {
+                b1_len / b2_len
+            };
             let p = self.p.load(Ordering::Relaxed);
             self.p.store(p.saturating_sub(delta), Ordering::Relaxed);
 
@@ -355,7 +367,8 @@ impl<K: Hash + Eq + Clone + 'static> ArcManager<K> {
                 let evicted_key = unsafe { evicted_node.deref().key.as_ref().unwrap().clone() };
                 let evicted_size = unsafe { evicted_node.deref().size };
 
-                self.t1_size.fetch_sub(evicted_size as u64, Ordering::Relaxed);
+                self.t1_size
+                    .fetch_sub(evicted_size as u64, Ordering::Relaxed);
                 self.t1_map.remove(&evicted_key);
 
                 // Add to ghost list B1
@@ -380,7 +393,8 @@ impl<K: Hash + Eq + Clone + 'static> ArcManager<K> {
                 let evicted_key = unsafe { evicted_node.deref().key.as_ref().unwrap().clone() };
                 let evicted_size = unsafe { evicted_node.deref().size };
 
-                self.t2_size.fetch_sub(evicted_size as u64, Ordering::Relaxed);
+                self.t2_size
+                    .fetch_sub(evicted_size as u64, Ordering::Relaxed);
                 self.t2_map.remove(&evicted_key);
 
                 // Add to ghost list B2

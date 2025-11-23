@@ -1,6 +1,4 @@
-use criterion::{
-    Criterion, Throughput, criterion_group, criterion_main, BenchmarkId,
-};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fluxmap::db::Database;
 use rand::Rng;
 use rand::prelude::{RngCore, SeedableRng};
@@ -34,7 +32,9 @@ fn bench_concurrent_reads_32(c: &mut Criterion) {
     rt.block_on(setup_db(&db));
 
     let mut group = c.benchmark_group("Concurrent Reads (32 Tasks)");
-    group.throughput(Throughput::Elements((OPS_PER_TASK * NUM_TASKS as u64) as u64));
+    group.throughput(Throughput::Elements(
+        (OPS_PER_TASK * NUM_TASKS as u64) as u64,
+    ));
 
     group.bench_with_input(
         BenchmarkId::from_parameter(NUM_TASKS),
@@ -74,7 +74,9 @@ fn bench_concurrent_writes_32(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
     let mut group = c.benchmark_group("Concurrent Writes (32 Tasks)");
-    group.throughput(Throughput::Elements((OPS_PER_TASK * NUM_TASKS as u64) as u64));
+    group.throughput(Throughput::Elements(
+        (OPS_PER_TASK * NUM_TASKS as u64) as u64,
+    ));
 
     group.bench_with_input(
         BenchmarkId::from_parameter(NUM_TASKS),

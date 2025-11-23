@@ -561,7 +561,10 @@ async fn test_transactional_prefix_scan_stream_merge() {
     tx_handle.begin().unwrap();
 
     // Perform operations within the transaction
-    tx_handle.insert("user:charlie".to_string(), 30).await.unwrap(); // Insert
+    tx_handle
+        .insert("user:charlie".to_string(), 30)
+        .await
+        .unwrap(); // Insert
     tx_handle.insert("user:dave".to_string(), 40).await.unwrap(); // Update
     tx_handle.remove(&"user:bob".to_string()).await.unwrap(); // Delete
     tx_handle.insert("guest:a".to_string(), 101).await.unwrap(); // Insert outside prefix
@@ -612,7 +615,6 @@ async fn test_builder_requires_max_memory_for_auto_eviction() {
         .await;
     assert!(res_lru_ok.is_ok());
 }
-
 
 #[tokio::test]
 async fn test_builder_with_custom_p_factor() {

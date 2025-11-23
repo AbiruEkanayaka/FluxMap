@@ -58,15 +58,15 @@
 //! # }
 //! ```
 
+use crate::SkipList;
 use crate::arc::ArcManager;
 use crate::error::{FluxError, PersistenceError};
 use crate::mem::{EvictionPolicy, MemSize};
 use crate::persistence::{DurabilityLevel, PersistenceEngine, PersistenceOptions};
-use crate::SkipList;
 use crate::transaction::Transaction;
 use futures::stream::StreamExt;
 use log::error;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -249,7 +249,10 @@ where
 {
     /// Configures the database for full durability (`fsync` per transaction).
     /// This makes the builder ready to build.
-    pub fn durability_full(mut self, options: PersistenceOptions) -> DatabaseBuilder<K, V, Buildable> {
+    pub fn durability_full(
+        mut self,
+        options: PersistenceOptions,
+    ) -> DatabaseBuilder<K, V, Buildable> {
         self.persistence_options = Some(options);
         self.is_full_durability = true;
         self.transition()
@@ -664,7 +667,9 @@ where
     {
         match config {
             DurabilityLevel::InMemory => Database::builder().build().await,
-            DurabilityLevel::Full { options } => Database::builder().durability_full(options).build().await,
+            DurabilityLevel::Full { options } => {
+                Database::builder().durability_full(options).build().await
+            }
             DurabilityLevel::Relaxed {
                 options,
                 flush_interval_ms,
@@ -982,8 +987,7 @@ where
             match tx_manager.commit(&tx, on_pre_commit) {
                 Ok(()) => {
                     if let Some(manager) = &self.arc_manager {
-                        manager
-                            .miss(key_for_eviction.clone(), allocated_size as usize);
+                        manager.miss(key_for_eviction.clone(), allocated_size as usize);
                     }
 
                     if self.db.eviction_policy == EvictionPolicy::Manual {

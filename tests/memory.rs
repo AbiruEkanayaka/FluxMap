@@ -172,11 +172,11 @@ async fn test_eviction_on_memory_limit_random() {
         .filter(|&&x| x)
         .count();
 
-    assert_eq!(
-        keys_present, 2,
-        "Exactly one key should have been evicted"
+    assert_eq!(keys_present, 2, "Exactly one key should have been evicted");
+    assert!(
+        key3_exists,
+        "The most recently inserted key should always exist post-eviction"
     );
-    assert!(key3_exists, "The most recently inserted key should always exist post-eviction");
 }
 
 #[tokio::test]
@@ -251,8 +251,7 @@ async fn test_manual_eviction_flow() {
 
     // Now, manually handle the eviction.
     // We'll implement a simple LRU-style eviction manually.
-    let mut victims: Vec<fluxmap::db::KeyMetadata<String>> =
-        handle.scan_metadata().collect().await;
+    let mut victims: Vec<fluxmap::db::KeyMetadata<String>> = handle.scan_metadata().collect().await;
     victims.sort_by_key(|v| v.last_accessed);
 
     assert!(!victims.is_empty());
