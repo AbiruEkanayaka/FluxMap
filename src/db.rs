@@ -78,6 +78,25 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+/// Defines the transaction isolation level for the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    /// Serializable Snapshot Isolation (SSI). The highest isolation level, which
+    /// prevents all anomalies including write-skew. This is the default.
+    Serializable,
+    /// Snapshot Isolation (SI). A slightly weaker level than Serializable. It is
+    /// vulnerable to write-skew anomalies but can offer better performance as it
+    /// avoids some conflict checks. Read-only transactions under SI will not be
+    /// aborted due to serialization conflicts.
+    Snapshot,
+}
+
+impl Default for IsolationLevel {
+    fn default() -> Self {
+        IsolationLevel::Serializable
+    }
+}
+
 /// Options for configuring the automatic vacuuming process.
 #[derive(Debug, Clone, Copy)]
 pub struct VacuumOptions {
@@ -129,7 +148,7 @@ impl BuilderState for Buildable {}
 ///
 /// # Examples
 /// ```
-/// # use fluxmap::db::{Database, VacuumOptions};
+/// # use fluxmap::db::{Database, VacuumOptions, IsolationLevel};
 /// # use fluxmap::persistence::{DurabilityLevel, PersistenceOptions};
 /// # use std::time::Duration;
 /// # use tempfile::tempdir;
@@ -149,6 +168,7 @@ impl BuilderState for Buildable {}
 ///         interval: Duration::from_secs(30),
 ///     })
 ///     .max_memory(512 * 1024 * 1024) // Set a 512MB memory limit
+///     .isolation_level(IsolationLevel::Snapshot) // Use Snapshot Isolation
 ///     .build()
 ///     .await
 ///     .unwrap();
@@ -165,6 +185,7 @@ pub struct DatabaseBuilder<K, V, S: BuilderState = Initial> {
     eviction_policy: EvictionPolicy,
     ttl: Option<Duration>,
     p_factor: Option<f64>,
+    isolation_level: IsolationLevel,
     _phantom: PhantomData<(K, V, S)>,
 }
 
@@ -213,6 +234,14 @@ impl<K, V, S: BuilderState> DatabaseBuilder<K, V, S> {
         self
     }
 
+    /// Sets the transaction isolation level.
+    ///
+    /// Defaults to `IsolationLevel::Serializable`.
+    pub fn isolation_level(mut self, level: IsolationLevel) -> Self {
+        self.isolation_level = level;
+        self
+    }
+
     /// A helper function to transition the builder to a new state.
     fn transition<NewState: BuilderState>(self) -> DatabaseBuilder<K, V, NewState> {
         DatabaseBuilder {
@@ -226,6 +255,7 @@ impl<K, V, S: BuilderState> DatabaseBuilder<K, V, S> {
             eviction_policy: self.eviction_policy,
             ttl: self.ttl,
             p_factor: self.p_factor,
+            isolation_level: self.isolation_level,
             _phantom: PhantomData,
         }
     }
@@ -457,6 +487,7 @@ where
         ttl: builder.ttl,
         arc_manager,
         fatal_error,
+        isolation_level: builder.isolation_level,
     })
 }
 
@@ -501,6 +532,7 @@ where
     arc_manager: Option<Arc<ArcManager<K>>>,
     /// A container for a fatal error message from a background thread.
     fatal_error: Arc<Mutex<Option<String>>>,
+    isolation_level: IsolationLevel,
 }
 
 impl<K, V> Drop for Database<K, V>
@@ -636,6 +668,7 @@ where
             eviction_policy: EvictionPolicy::default(),
             ttl: None,
             p_factor: None,
+            isolation_level: IsolationLevel::default(),
             _phantom: PhantomData,
         }
     }
@@ -916,7 +949,7 @@ where
             if let (Some(manager), Some(_)) = (&self.arc_manager, &result) {
                 manager.hit(key);
             }
-            tx_manager.commit(&tx, || Ok(())).unwrap(); // Autocommit for reads cannot fail.
+            tx_manager.commit(&tx, || Ok(()), self.db.isolation_level)?;
             Ok(result)
         }
     }
@@ -984,7 +1017,7 @@ where
             };
 
             // Attempt to commit with the WAL hook.
-            match tx_manager.commit(&tx, on_pre_commit) {
+            match tx_manager.commit(&tx, on_pre_commit, self.db.isolation_level) {
                 Ok(()) => {
                     if let Some(manager) = &self.arc_manager {
                         manager.miss(key_for_eviction.clone(), allocated_size as usize);
@@ -1075,7 +1108,7 @@ where
             };
 
             // Attempt to commit with the WAL hook.
-            match tx_manager.commit(&tx, on_pre_commit) {
+            match tx_manager.commit(&tx, on_pre_commit, self.db.isolation_level) {
                 Ok(()) => Ok(result),
                 Err(e) => Err(e),
             }
@@ -1150,7 +1183,7 @@ where
             let tx_manager = self.skiplist.transaction_manager();
             let tx = tx_manager.begin();
             let results = self.skiplist.range(start, end, &tx);
-            tx_manager.commit(&tx, || Ok(())).unwrap(); // Autocommit for reads cannot fail.
+            tx_manager.commit(&tx, || Ok(()), self.db.isolation_level)?;
             Ok(results)
         }
     }
@@ -1246,7 +1279,9 @@ where
                 while let Some(item) = stream.next().await {
                     yield Ok(item);
                 }
-                tx_manager.commit(&tx, || Ok(())).unwrap();
+                if let Err(e) = tx_manager.commit(&tx, || Ok(()), self.db.isolation_level) {
+                    yield Err(e);
+                }
             }
         }
     }
@@ -1319,7 +1354,7 @@ where
             Ok(())
         };
 
-        match tx_manager.commit(&active_tx, on_pre_commit) {
+        match tx_manager.commit(&active_tx, on_pre_commit, self.db.isolation_level) {
             Ok(()) => {
                 // For explicit transactions, we don't spare any specific key,
                 // as multiple keys could have been inserted.
@@ -1521,7 +1556,7 @@ where
             let tx_manager = self.skiplist.transaction_manager();
             let tx = tx_manager.begin();
             let results = self.skiplist.prefix_scan(prefix, &tx);
-            tx_manager.commit(&tx, || Ok(())).unwrap();
+            tx_manager.commit(&tx, || Ok(()), self.db.isolation_level)?;
             Ok(results)
         }
     }
@@ -1616,7 +1651,9 @@ where
                 while let Some(item) = stream.next().await {
                     yield Ok(item);
                 }
-                tx_manager.commit(&tx, || Ok(())).unwrap();
+                if let Err(e) = tx_manager.commit(&tx, || Ok(()), self.db.isolation_level) {
+                    yield Err(e);
+                }
             }
         }
     }

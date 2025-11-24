@@ -24,6 +24,7 @@
 //!     the ID of the transaction that created it (`creator_txid`), and the ID
 //!     of the transaction that expired it (`expirer_txid`).
 
+use crate::db::IsolationLevel;
 use crate::error::FluxError;
 use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -117,74 +118,82 @@ where
     /// This performs the Serializable Snapshot Isolation (SSI) conflict checks.
     /// If a conflict is detected, the transaction is aborted and a `SerializationConflict`
     /// error is returned. Otherwise, the transaction is marked as committed.
-    pub fn commit<F>(&self, tx: &Transaction<K, V>, on_pre_commit: F) -> Result<(), FluxError>
+    pub fn commit<F>(
+        &self,
+        tx: &Transaction<K, V>,
+        on_pre_commit: F,
+        isolation_level: IsolationLevel,
+    ) -> Result<(), FluxError>
     where
         F: FnOnce() -> Result<(), FluxError>,
         K: Ord + std::borrow::Borrow<str>,
     {
-        // SSI: Incoming conflict check.
-        // If another transaction has written to a key that this transaction read,
-        // or inserted into a range this transaction scanned, and that other transaction
-        // committed, then this transaction must abort.
-        if tx.in_conflict.load(Ordering::Acquire) {
-            self.abort(tx);
-            return Err(FluxError::SerializationConflict);
-        }
+        if isolation_level == IsolationLevel::Serializable {
+            // SSI: Incoming conflict check.
+            // If another transaction has written to a key that this transaction read,
+            // or inserted into a range this transaction scanned, and that other transaction
+            // committed, then this transaction must abort.
+            if tx.in_conflict.load(Ordering::Acquire) {
+                self.abort(tx);
+                return Err(FluxError::SerializationConflict);
+            }
 
-        // SSI: Outgoing conflict check for phantoms.
-        // Check if this transaction's insertions create a phantom for another active transaction.
-        for inserted_key in tx.insert_set.iter() {
-            for other_tx_entry in self.active_transactions.iter() {
-                let other_tx = other_tx_entry.value();
-                if other_tx.id == tx.id {
-                    continue;
-                }
-
-                // Check against range scans
-                let other_ranges = other_tx.range_scans.read().unwrap();
-                for (start, end) in other_ranges.iter() {
-                    if inserted_key.key() >= start && inserted_key.key() <= end {
-                        other_tx.in_conflict.store(true, Ordering::Release);
-                        break; // Move to the next active transaction
+            // SSI: Outgoing conflict check for phantoms.
+            // Check if this transaction's insertions create a phantom for another active transaction.
+            for inserted_key in tx.insert_set.iter() {
+                for other_tx_entry in self.active_transactions.iter() {
+                    let other_tx = other_tx_entry.value();
+                    if other_tx.id == tx.id {
+                        continue;
                     }
-                }
 
-                if other_tx.in_conflict.load(Ordering::Relaxed) {
-                    continue;
-                }
+                    // Check against range scans
+                    let other_ranges = other_tx.range_scans.read().unwrap();
+                    for (start, end) in other_ranges.iter() {
+                        if inserted_key.key() >= start && inserted_key.key() <= end {
+                            other_tx.in_conflict.store(true, Ordering::Release);
+                            break; // Move to the next active transaction
+                        }
+                    }
 
-                // Check against prefix scans
-                let other_prefixes = other_tx.prefix_scans.read().unwrap();
-                for prefix in other_prefixes.iter() {
-                    if inserted_key.key().borrow().starts_with(prefix) {
-                        other_tx.in_conflict.store(true, Ordering::Release);
-                        break; // Move to the next active transaction
+                    if other_tx.in_conflict.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    // Check against prefix scans
+                    let other_prefixes = other_tx.prefix_scans.read().unwrap();
+                    for prefix in other_prefixes.iter() {
+                        if inserted_key.key().borrow().starts_with(prefix) {
+                            other_tx.in_conflict.store(true, Ordering::Release);
+                            break; // Move to the next active transaction
+                        }
                     }
                 }
             }
-        }
 
-        // SSI: Outgoing conflict check for read-write conflicts.
-        // Notify other transactions that read keys we are now writing to.
-        for written_key in tx.write_set.iter() {
-            let key: &K = written_key.key();
-            if let Some(reader_tx_ids) = self.read_trackers.get(key.borrow()) {
-                for reader_tx_id in reader_tx_ids.iter() {
-                    // Only signal other active transactions, not ourselves.
-                    if *reader_tx_id == tx.id {
-                        continue;
-                    }
-                    if let Some(reader_tx_entry) = self.active_transactions.get(&reader_tx_id) {
-                        reader_tx_entry
-                            .value()
-                            .in_conflict
-                            .store(true, Ordering::Release);
+            // SSI: Outgoing conflict check for read-write conflicts.
+            // Notify other transactions that read keys we are now writing to.
+            for written_key in tx.write_set.iter() {
+                let key: &K = written_key.key();
+                if let Some(reader_tx_ids) = self.read_trackers.get(key.borrow()) {
+                    for reader_tx_id in reader_tx_ids.iter() {
+                        // Only signal other active transactions, not ourselves.
+                        if *reader_tx_id == tx.id {
+                            continue;
+                        }
+                        if let Some(reader_tx_entry) = self.active_transactions.get(&reader_tx_id) {
+                            reader_tx_entry
+                                .value()
+                                .in_conflict
+                                .store(true, Ordering::Release);
+                        }
                     }
                 }
             }
         }
 
         // The transaction is valid to commit from an SSI perspective.
+        // Or we are in a weaker isolation level.
         // Now, execute the pre-commit hook (e.g., for WAL logging).
         if let Err(e) = on_pre_commit() {
             // If the pre-commit hook fails, we must abort the transaction.

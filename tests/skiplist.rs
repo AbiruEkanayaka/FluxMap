@@ -1,3 +1,4 @@
+use fluxmap::db::IsolationLevel;
 use fluxmap::{SkipList, error};
 use futures::StreamExt;
 use futures::pin_mut;
@@ -41,7 +42,7 @@ async fn test_insert_and_get() {
     skip_list
         .insert("b".to_string(), Arc::new("two".to_string()), &writer_tx)
         .await;
-    tx_manager.commit(&writer_tx, || Ok(())).unwrap();
+    tx_manager.commit(&writer_tx, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // Reader Transaction
     let reader_tx = tx_manager.begin();
@@ -75,7 +76,7 @@ async fn test_insert_duplicate_key() {
     skip_list
         .insert("a".to_string(), Arc::new("one_new".to_string()), &writer_tx)
         .await; // Prepend new version
-    tx_manager.commit(&writer_tx, || Ok(())).unwrap();
+    tx_manager.commit(&writer_tx, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let reader_tx = tx_manager.begin();
     assert_eq!(skip_list.len(), 1);
@@ -96,14 +97,14 @@ async fn test_update_value() {
     skip_list
         .insert("a".to_string(), Arc::new("one".to_string()), &writer_tx_1)
         .await;
-    tx_manager.commit(&writer_tx_1, || Ok(())).unwrap();
+    tx_manager.commit(&writer_tx_1, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let reader_tx_1 = tx_manager.begin();
     assert_eq!(
         *skip_list.get(&"a".to_string(), &reader_tx_1).unwrap(),
         "one".to_string()
     );
-    tx_manager.commit(&reader_tx_1, || Ok(())).unwrap(); // Commit the reader to release dependencies
+    tx_manager.commit(&reader_tx_1, || Ok(()), IsolationLevel::Serializable).unwrap(); // Commit the reader to release dependencies
 
     let writer_tx_2 = tx_manager.begin();
     skip_list
@@ -113,7 +114,7 @@ async fn test_update_value() {
             &writer_tx_2,
         )
         .await;
-    tx_manager.commit(&writer_tx_2, || Ok(())).unwrap();
+    tx_manager.commit(&writer_tx_2, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let reader_tx_2 = tx_manager.begin();
     assert_eq!(skip_list.len(), 1);
@@ -149,7 +150,7 @@ async fn test_remove() {
     skip_list
         .insert("c".to_string(), Arc::new("three".to_string()), &writer_tx)
         .await;
-    tx_manager.commit(&writer_tx, || Ok(())).unwrap();
+    tx_manager.commit(&writer_tx, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let reader_tx_1 = tx_manager.begin();
     assert_eq!(skip_list.len(), 3);
@@ -162,7 +163,7 @@ async fn test_remove() {
             .unwrap(),
         "two".to_string()
     );
-    tx_manager.commit(&remover_tx, || Ok(())).unwrap();
+    tx_manager.commit(&remover_tx, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let reader_tx_2 = tx_manager.begin();
     assert_eq!(skip_list.len(), 3);
@@ -195,7 +196,7 @@ async fn test_contains_key() {
     skip_list
         .insert("c".to_string(), Arc::new("three".to_string()), &writer_tx)
         .await;
-    tx_manager.commit(&writer_tx, || Ok(())).unwrap();
+    tx_manager.commit(&writer_tx, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let reader_tx = tx_manager.begin();
     assert!(skip_list.contains_key(&"a".to_string(), &reader_tx));
@@ -227,7 +228,7 @@ async fn test_range() {
     skip_list
         .insert("e".to_string(), Arc::new("5".to_string()), &writer_tx)
         .await;
-    tx_manager.commit(&writer_tx, || Ok(())).unwrap();
+    tx_manager.commit(&writer_tx, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let reader_tx = tx_manager.begin();
     let range = skip_list.range(&"b".to_string(), &"d".to_string(), &reader_tx);
@@ -260,7 +261,7 @@ async fn test_prefix_scan() {
     skip_list
         .insert("bandana".to_string(), Arc::new("4".to_string()), &writer_tx)
         .await;
-    tx_manager.commit(&writer_tx, || Ok(())).unwrap();
+    tx_manager.commit(&writer_tx, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let reader_tx = tx_manager.begin();
     let scan = skip_list.prefix_scan("app", &reader_tx);
@@ -295,7 +296,7 @@ async fn test_range_stream() {
     skip_list
         .insert("e".to_string(), Arc::new("5".to_string()), &writer_tx)
         .await;
-    tx_manager.commit(&writer_tx, || Ok(())).unwrap();
+    tx_manager.commit(&writer_tx, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let reader_tx = tx_manager.begin();
     let start_key = "b".to_string();
@@ -325,7 +326,7 @@ async fn test_prefix_scan_stream() {
     skip_list
         .insert("banana".to_string(), Arc::new("3".to_string()), &writer_tx)
         .await;
-    tx_manager.commit(&writer_tx, || Ok(())).unwrap();
+    tx_manager.commit(&writer_tx, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let reader_tx = tx_manager.begin();
     let prefix_key = "app".to_string();
@@ -352,7 +353,7 @@ async fn test_concurrent_insert() {
             skip_list
                 .insert(i.to_string(), Arc::new(i.to_string()), &tx)
                 .await;
-            tx_manager.commit(&tx, || Ok(())).unwrap();
+            tx_manager.commit(&tx, || Ok(()), IsolationLevel::Serializable).unwrap();
         }));
     }
 
@@ -380,7 +381,7 @@ async fn test_concurrent_insert_and_remove() {
             skip_list
                 .insert(i.to_string(), Arc::new(i.to_string()), &tx)
                 .await;
-            tx_manager.commit(&tx, || Ok(())).unwrap();
+            tx_manager.commit(&tx, || Ok(()), IsolationLevel::Serializable).unwrap();
         }));
     }
     for task in tasks {
@@ -397,7 +398,7 @@ async fn test_concurrent_insert_and_remove() {
         tasks.push(tokio::spawn(async move {
             let tx = tx_manager.begin();
             skip_list.remove(&i.to_string(), &tx).await;
-            tx_manager.commit(&tx, || Ok(())).unwrap();
+            tx_manager.commit(&tx, || Ok(()), IsolationLevel::Serializable).unwrap();
         }));
     }
     for task in tasks {
@@ -466,7 +467,7 @@ async fn test_stress_concurrent_operations() {
                     _ => unreachable!(),
                 }
             }
-            tx_manager.commit(&tx, || Ok(())).unwrap();
+            tx_manager.commit(&tx, || Ok(()), IsolationLevel::Serializable).unwrap();
         }));
     }
 
@@ -507,7 +508,7 @@ async fn test_concurrent_range_stream_modifications() {
                     _ => unreachable!(),
                 }
             }
-            tx_manager.commit(&tx, || Ok(())).unwrap();
+            tx_manager.commit(&tx, || Ok(()), IsolationLevel::Serializable).unwrap();
         }));
     }
 
@@ -566,7 +567,7 @@ async fn test_concurrent_prefix_scan_modifications() {
                     _ => unreachable!(),
                 }
             }
-            tx_manager.commit(&tx, || Ok(())).unwrap();
+            tx_manager.commit(&tx, || Ok(()), IsolationLevel::Serializable).unwrap();
         }));
     }
 
@@ -607,7 +608,7 @@ async fn test_write_skew_prevention() {
     skip_list
         .insert("y".to_string(), Arc::new(40), &setup_tx)
         .await;
-    tx_manager.commit(&setup_tx, || Ok(())).unwrap();
+    tx_manager.commit(&setup_tx, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // Transaction 1: Reads x and y, then writes to x.
     let tx1 = tx_manager.begin();
@@ -631,8 +632,8 @@ async fn test_write_skew_prevention() {
     skip_list.insert("y".to_string(), Arc::new(10), &tx2).await;
 
     // Now, attempt to commit both. One must fail.
-    let commit1_result = tx_manager.commit(&tx1, || Ok(()));
-    let commit2_result = tx_manager.commit(&tx2, || Ok(()));
+    let commit1_result = tx_manager.commit(&tx1, || Ok(()), IsolationLevel::Serializable);
+    let commit2_result = tx_manager.commit(&tx2, || Ok(()), IsolationLevel::Serializable);
 
     let success = commit1_result.is_ok() || commit2_result.is_ok();
     let failure = commit1_result.is_err() || commit2_result.is_err();
@@ -683,13 +684,13 @@ async fn test_vacuum() {
     let tx1 = tx_manager.begin();
     skip_list.insert("x".to_string(), Arc::new(10), &tx1).await;
     skip_list.insert("y".to_string(), Arc::new(20), &tx1).await;
-    tx_manager.commit(&tx1, || Ok(())).unwrap();
+    tx_manager.commit(&tx1, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // Tx2: Delete x, Update y to 30
     let tx2 = tx_manager.begin();
     skip_list.remove(&"x".to_string(), &tx2).await;
     skip_list.insert("y".to_string(), Arc::new(30), &tx2).await; // This prepends a new version, does not expire the old one.
-    tx_manager.commit(&tx2, || Ok(())).unwrap();
+    tx_manager.commit(&tx2, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // Run vacuum. Only the version of `x` was explicitly removed.
     let (versions_removed, _keys_removed) = skip_list.vacuum().await.unwrap();
@@ -704,29 +705,29 @@ async fn test_vacuum() {
     let final_tx = tx_manager.begin();
     assert!(skip_list.get(&"x".to_string(), &final_tx).is_none());
     assert_eq!(*skip_list.get(&"y".to_string(), &final_tx).unwrap(), 30);
-    tx_manager.commit(&final_tx, || Ok(())).unwrap();
+    tx_manager.commit(&final_tx, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // --- Test multiple dead versions for the same key ---
     // Create a situation with multiple expired versions for a single key 'z'
     let tx3 = tx_manager.begin();
     skip_list.insert("z".to_string(), Arc::new(1), &tx3).await;
-    tx_manager.commit(&tx3, || Ok(())).unwrap();
+    tx_manager.commit(&tx3, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let tx4 = tx_manager.begin();
     skip_list.remove(&"z".to_string(), &tx4).await; // Expires z=1
-    tx_manager.commit(&tx4, || Ok(())).unwrap();
+    tx_manager.commit(&tx4, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let tx5 = tx_manager.begin();
     skip_list.insert("z".to_string(), Arc::new(2), &tx5).await;
-    tx_manager.commit(&tx5, || Ok(())).unwrap();
+    tx_manager.commit(&tx5, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let tx6 = tx_manager.begin();
     skip_list.remove(&"z".to_string(), &tx6).await; // Expires z=2
-    tx_manager.commit(&tx6, || Ok(())).unwrap();
+    tx_manager.commit(&tx6, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let tx7 = tx_manager.begin();
     skip_list.insert("z".to_string(), Arc::new(3), &tx7).await; // Current visible version
-    tx_manager.commit(&tx7, || Ok(())).unwrap();
+    tx_manager.commit(&tx7, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // The version chain for 'z' is now 3 -> 2(expired) -> 1(expired)
     // The vacuum should remove the two expired versions.
@@ -748,7 +749,7 @@ async fn test_vacuum_removes_node() {
     // Tx1: Insert "a"
     let tx1 = tx_manager.begin();
     skip_list.insert("a".to_string(), Arc::new(1), &tx1).await;
-    tx_manager.commit(&tx1, || Ok(())).unwrap();
+    tx_manager.commit(&tx1, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // Tx2: Remove "a"
     let tx2 = tx_manager.begin();
@@ -756,12 +757,12 @@ async fn test_vacuum_removes_node() {
         skip_list.remove(&"a".to_string(), &tx2).await.unwrap(),
         Arc::new(1)
     );
-    tx_manager.commit(&tx2, || Ok(())).unwrap();
+    tx_manager.commit(&tx2, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // Before vacuum, the node for "a" still exists but has no visible versions.
     let tx3 = tx_manager.begin();
     assert!(skip_list.get(&"a".to_string(), &tx3).is_none());
-    tx_manager.commit(&tx3, || Ok(())).unwrap();
+    tx_manager.commit(&tx3, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // Run vacuum. This should remove the dead version of "a" and then
     // mark the now-empty node as "deleted".
@@ -774,7 +775,7 @@ async fn test_vacuum_removes_node() {
     // confirm the key remains inaccessible.
     let tx4 = tx_manager.begin();
     assert!(skip_list.get(&"a".to_string(), &tx4).is_none());
-    tx_manager.commit(&tx4, || Ok(())).unwrap();
+    tx_manager.commit(&tx4, || Ok(()), IsolationLevel::Serializable).unwrap();
 }
 
 #[tokio::test]
@@ -787,7 +788,7 @@ async fn test_remove_respects_snapshot() {
     // Tx1: Insert "a" with value 1
     let tx1 = tx_manager.begin();
     skip_list.insert("a".to_string(), Arc::new(1), &tx1).await;
-    tx_manager.commit(&tx1, || Ok(())).unwrap();
+    tx_manager.commit(&tx1, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // Tx2 (Updater): Start a transaction to update "a" to 2, but DON'T commit yet.
     // This creates a new version that is not visible to other transactions.
@@ -816,7 +817,7 @@ async fn test_remove_respects_snapshot() {
     );
 
     // Commit the removal.
-    tx_manager.commit(&tx3_remover, || Ok(())).unwrap();
+    tx_manager.commit(&tx3_remover, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // Tx4 (Final Reader): A new transaction should see the key as removed.
     let tx4_reader = tx_manager.begin();
@@ -826,7 +827,7 @@ async fn test_remove_respects_snapshot() {
     );
 
     // The uncommitted updater transaction should now fail if it tries to commit.
-    let commit_result = tx_manager.commit(&tx2_updater, || Ok(()));
+    let commit_result = tx_manager.commit(&tx2_updater, || Ok(()), IsolationLevel::Serializable);
     assert!(
         commit_result.is_err(),
         "Updater transaction should fail to commit due to conflict"
@@ -847,7 +848,7 @@ async fn test_vacuum_handles_uncommitted_expirer() {
     // Tx1: Insert "a" with value 1 and commit.
     let tx1 = tx_manager.begin();
     skip_list.insert("a".to_string(), Arc::new(1), &tx1).await;
-    tx_manager.commit(&tx1, || Ok(())).unwrap();
+    tx_manager.commit(&tx1, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // Tx2: Remove "a" but DO NOT commit yet.
     // This creates a version (value 1) expired by an uncommitted transaction (Tx2).
@@ -879,7 +880,7 @@ async fn test_vacuum_handles_uncommitted_expirer() {
     );
 
     // Commit tx2_expirer. Now the version expired by tx2 is truly dead.
-    tx_manager.commit(&tx2_expirer, || Ok(())).unwrap();
+    tx_manager.commit(&tx2_expirer, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     // Run vacuum again. Now it SHOULD remove the version.
     let (versions_removed_after_commit, keys_removed_after_commit) =
@@ -914,7 +915,7 @@ async fn test_transaction_status_pruning() {
         skip_list
             .insert(format!("key{}", i), Arc::new(i), &tx)
             .await;
-        tx_manager.commit(&tx, || Ok(())).unwrap();
+        tx_manager.commit(&tx, || Ok(()), IsolationLevel::Serializable).unwrap();
         committed_tx_ids.push(tx.id);
     }
 

@@ -23,6 +23,7 @@
 //!     consistent state.
 
 use crate::SkipList;
+use crate::db::IsolationLevel;
 use crate::mem::MemSize;
 use crate::transaction::Workspace;
 use log::error;
@@ -623,7 +624,7 @@ where
         }
 
         // 6. Commit the recovery transaction
-        tx_manager.commit(&tx, || Ok(()))?;
+        tx_manager.commit(&tx, || Ok(()), IsolationLevel::Serializable)?;
 
         Ok(skiplist)
     }

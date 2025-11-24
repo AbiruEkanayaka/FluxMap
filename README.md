@@ -325,6 +325,27 @@ You can control the trade-off between performance and safety by configuring dura
 -   **`Relaxed`**: (Group Commit) Commits are written to the OS buffer and a background thread flushes them to disk when the first of several conditions is met (e.g., time elapsed, number of commits, or bytes written). This offers high performance and durability against process crashes, but recent commits may be lost in case of an OS crash or power failure.
 -   **`Full`**: (fsync-per-transaction) Each transaction is fully synced to the disk before the `commit` call returns. This provides the strongest durability guarantee but has a higher performance overhead.
 
+### Isolation Levels
+
+FluxMap supports configurable transaction isolation levels via the `DatabaseBuilder`.
+
+-   **`Serializable` (default):** Serializable Snapshot Isolation (SSI). This is the strongest level, providing true serializability and protecting against all concurrency anomalies, including write skew. It achieves this by tracking read/write dependencies and aborting transactions that could violate serializability.
+
+-   **`Snapshot`:** Snapshot Isolation (SI). This is a slightly weaker, more optimistic level. It still provides many of the benefits of MVCC, such as non-blocking reads, but it is vulnerable to *write skew* anomalies. It can offer higher performance for some workloads because it avoids the dependency tracking overhead of SSI. Read-only transactions are guaranteed not to be aborted under this level.
+
+```rust
+use fluxmap::db::{Database, IsolationLevel};
+# #[tokio::main]
+# async fn main() {
+// For workloads where write-skew is not a concern, you can use Snapshot Isolation for potentially higher performance.
+let db = Database::<String, String>::builder()
+    .isolation_level(IsolationLevel::Snapshot)
+    .build()
+    .await
+    .unwrap();
+# }
+```
+
 ### Durability Mechanism: WAL and Snapshots
 
 When a durability level other than `InMemory` is chosen, FluxMap uses a Write-Ahead Log (WAL) combined with periodic snapshotting to provide crash safety and manage disk space. This is a standard and robust technique used by many production databases.
