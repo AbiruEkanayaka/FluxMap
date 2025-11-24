@@ -617,6 +617,149 @@ async fn test_builder_requires_max_memory_for_auto_eviction() {
 }
 
 #[tokio::test]
+async fn test_transaction_savepoint() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+    let mut handle = db.handle();
+
+    handle.begin().unwrap();
+
+    handle.insert("a".to_string(), 1).await.unwrap();
+    handle.savepoint("sp1").unwrap();
+
+    handle.insert("a".to_string(), 2).await.unwrap();
+    handle.insert("b".to_string(), 20).await.unwrap();
+
+    // Check value before rollback_to
+    assert_eq!(*handle.get(&"a".to_string()).unwrap().unwrap(), 2);
+    assert!(handle.get(&"b".to_string()).unwrap().is_some());
+
+    handle.rollback_to("sp1").unwrap();
+
+    // Check after rollback_to
+    assert_eq!(*handle.get(&"a".to_string()).unwrap().unwrap(), 1);
+    assert!(handle.get(&"b".to_string()).unwrap().is_none());
+
+    // Check that savepoint is gone
+    assert_eq!(
+        handle.rollback_to("sp1").unwrap_err(),
+        FluxError::SavepointNotFound("sp1".to_string())
+    );
+
+    handle.commit().await.unwrap();
+
+    // Verify final state in DB
+    let final_handle = db.handle();
+    assert_eq!(*final_handle.get(&"a".to_string()).unwrap().unwrap(), 1);
+    assert!(final_handle.get(&"b".to_string()).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_rollback_to_nonexistent_savepoint() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+    let mut handle = db.handle();
+
+    handle.begin().unwrap();
+    handle.insert("a".to_string(), 1).await.unwrap();
+    let res = handle.rollback_to("nonexistent");
+    assert!(res.is_err());
+    assert_eq!(
+        res.unwrap_err(),
+        FluxError::SavepointNotFound("nonexistent".to_string())
+    );
+    handle.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_nested_savepoints() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+    let mut handle = db.handle();
+
+    handle.begin().unwrap();
+    handle.insert("x".to_string(), 100).await.unwrap();
+    handle.savepoint("sp1").unwrap();
+
+    handle.insert("y".to_string(), 200).await.unwrap();
+    handle.savepoint("sp2").unwrap();
+
+    handle.insert("z".to_string(), 300).await.unwrap();
+
+    // Rollback to sp2
+    handle.rollback_to("sp2").unwrap();
+    assert_eq!(*handle.get(&"x".to_string()).unwrap().unwrap(), 100);
+    assert_eq!(*handle.get(&"y".to_string()).unwrap().unwrap(), 200);
+    assert!(handle.get(&"z".to_string()).unwrap().is_none());
+    assert!(handle.rollback_to("sp2").is_err()); // sp2 should be gone
+
+    // Rollback to sp1
+    handle.rollback_to("sp1").unwrap();
+    assert_eq!(*handle.get(&"x".to_string()).unwrap().unwrap(), 100);
+    assert!(handle.get(&"y".to_string()).unwrap().is_none());
+    assert!(handle.get(&"z".to_string()).unwrap().is_none());
+
+    handle.commit().await.unwrap();
+
+    let final_handle = db.handle();
+    assert_eq!(*final_handle.get(&"x".to_string()).unwrap().unwrap(), 100);
+    assert!(final_handle.get(&"y".to_string()).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_full_rollback_discards_savepoints() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+    let mut handle = db.handle();
+
+    handle.begin().unwrap();
+    handle.insert("a".to_string(), 1).await.unwrap();
+    handle.savepoint("sp1").unwrap();
+    handle.insert("b".to_string(), 2).await.unwrap();
+
+    handle.rollback().unwrap();
+
+    // After a full rollback, the transaction is gone.
+    assert!(handle.commit().await.is_err()); // No active transaction
+
+    // Nothing should be in the DB
+    let final_handle = db.handle();
+    assert!(final_handle.get(&"a".to_string()).unwrap().is_none());
+    assert!(final_handle.get(&"b".to_string()).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_duplicate_savepoint_names() {
+    let db: Arc<Database<String, i32>> = Arc::new(Database::builder().build().await.unwrap());
+    let mut handle = db.handle();
+
+    handle.begin().unwrap();
+    handle.insert("val".to_string(), 1).await.unwrap();
+    handle.savepoint("sp").unwrap(); // pos 0
+
+    handle.insert("val".to_string(), 2).await.unwrap();
+    handle.savepoint("sp").unwrap(); // pos 1
+
+    handle.insert("val".to_string(), 3).await.unwrap();
+    assert_eq!(*handle.get(&"val".to_string()).unwrap().unwrap(), 3);
+
+    // Rollback to the most recent 'sp' (at pos 1)
+    handle.rollback_to("sp").unwrap();
+    assert_eq!(*handle.get(&"val".to_string()).unwrap().unwrap(), 2);
+    // The savepoints vec is now truncated to pos 1, so it contains only the first 'sp'.
+
+    // Rollback to the first 'sp' (now at pos 0)
+    handle.rollback_to("sp").unwrap();
+    assert_eq!(*handle.get(&"val".to_string()).unwrap().unwrap(), 1);
+    // The savepoints vec is now truncated to pos 0, so it's empty.
+
+    // No more savepoints named 'sp'
+    assert_eq!(
+        handle.rollback_to("sp").unwrap_err(),
+        FluxError::SavepointNotFound("sp".to_string())
+    );
+
+    handle.commit().await.unwrap();
+    assert_eq!(*db.handle().get(&"val".to_string()).unwrap().unwrap(), 1);
+}
+
+#[tokio::test]
 async fn test_builder_with_custom_p_factor() {
     let db_res = Database::<String, String>::builder()
         .skiplist_p(0.25)

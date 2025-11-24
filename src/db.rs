@@ -1357,6 +1357,63 @@ where
         Ok(())
     }
 
+    /// Creates a savepoint within the current transaction.
+    ///
+    /// A savepoint allows for partial rollbacks to a named point within a transaction.
+    /// If a savepoint with the same name is created, it shadows the previous one.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FluxError::NoActiveTransaction` if no transaction is active.
+    pub fn savepoint(&mut self, name: &str) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
+        let active_tx = self
+            .active_tx
+            .as_ref()
+            .ok_or(FluxError::NoActiveTransaction)?;
+
+        let workspace = active_tx.workspace.read().unwrap();
+        let mut savepoints = active_tx.savepoints.write().unwrap();
+
+        savepoints.push((name.to_string(), workspace.clone()));
+        Ok(())
+    }
+
+    /// Rolls back the transaction to a previously created savepoint.
+    ///
+    /// This discards all changes made in the transaction since the savepoint was created.
+    /// The savepoint itself and any savepoints created after it are also discarded.
+    ///
+    /// # Errors
+    ///
+    /// - `FluxError::NoActiveTransaction` if no transaction is active.
+    /// - `FluxError::SavepointNotFound` if the named savepoint does not exist.
+    pub fn rollback_to(&mut self, name: &str) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
+        let active_tx = self
+            .active_tx
+            .as_ref()
+            .ok_or(FluxError::NoActiveTransaction)?;
+
+        let mut savepoints = active_tx.savepoints.write().unwrap();
+        // Find the most recent savepoint with the given name.
+        if let Some(pos) = savepoints.iter().rposition(|(sp_name, _)| sp_name == name) {
+            // Found the savepoint.
+            let (_, saved_workspace) = savepoints[pos].clone();
+
+            // Restore the workspace.
+            let mut current_workspace = active_tx.workspace.write().unwrap();
+            *current_workspace = saved_workspace;
+
+            // Remove the used savepoint and any subsequent ones.
+            savepoints.truncate(pos);
+
+            Ok(())
+        } else {
+            Err(FluxError::SavepointNotFound(name.to_string()))
+        }
+    }
+
     /// Executes a closure within a managed transaction.
     ///
     /// This is the recommended, high-level way to run a transaction. It automatically

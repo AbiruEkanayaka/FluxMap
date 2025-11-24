@@ -395,6 +395,8 @@ pub struct Transaction<K: Eq + std::hash::Hash, V> {
     /// The transaction's private workspace for pending changes (inserts, updates, deletes).
     /// These changes are only applied to the main database upon a successful commit.
     pub workspace: RwLock<Workspace<K, V>>,
+    /// A stack of named savepoints, each holding a snapshot of the workspace.
+    pub savepoints: RwLock<Vec<(String, Workspace<K, V>)>>,
     _phantom: std::marker::PhantomData<V>,
 }
 
@@ -415,6 +417,7 @@ where
             prefix_scans: RwLock::new(Vec::new()),
             in_conflict: AtomicBool::new(false),
             workspace: RwLock::new(HashMap::new()), // Initialize workspace
+            savepoints: RwLock::new(Vec::new()),
             _phantom: std::marker::PhantomData,
         }
     }

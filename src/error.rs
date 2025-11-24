@@ -17,6 +17,8 @@ pub enum FluxError {
     TransactionAlreadyActive,
     /// Occurs when `commit()` or `rollback()` is called on a `Handle` with no active transaction.
     NoActiveTransaction,
+    /// A specified savepoint name was not found within the active transaction.
+    SavepointNotFound(String),
     /// Wraps an error originating from the persistence layer.
     Persistence(PersistenceError),
     /// Represents an error during the key eviction process, e.g., no victim could be found.
@@ -65,6 +67,9 @@ impl fmt::Display for FluxError {
             }
             FluxError::NoActiveTransaction => {
                 write!(f, "No active transaction on this handle")
+            }
+            FluxError::SavepointNotFound(name) => {
+                write!(f, "Savepoint '{}' not found in active transaction", name)
             }
             FluxError::Persistence(e) => write!(f, "Persistence error: {}", e),
             FluxError::EvictionError => write!(f, "Eviction error: could not find or evict a key"),
