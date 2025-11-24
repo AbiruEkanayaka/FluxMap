@@ -101,7 +101,7 @@ impl<K, V> Node<K, V> {
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
         Node {
             key: Some(key),
             value: Atomic::from(version_node_ptr),
@@ -575,7 +575,7 @@ where
                             std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
-                                .as_secs(),
+                                .as_millis() as u64,
                             Ordering::Relaxed,
                         );
 
@@ -988,8 +988,8 @@ where
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        let ttl_secs = ttl.as_secs();
+            .as_millis() as u64;
+        let ttl_millis = ttl.as_millis() as u64;
 
         let mut victims = Vec::new();
         let mut current = self.head.load(Ordering::Relaxed, guard);
@@ -1004,7 +1004,7 @@ where
 
             if node_ref.key.is_some() && !node_ref.deleted.load(Ordering::Acquire) {
                 let last_modified = node_ref.last_modified.load(Ordering::Relaxed);
-                if now.saturating_sub(last_modified) > ttl_secs {
+                if now.saturating_sub(last_modified) >= ttl_millis {
                     victims.push(node_ref.key.as_ref().unwrap().clone());
                 }
             }
