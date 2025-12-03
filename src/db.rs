@@ -919,7 +919,7 @@ where
             let tx_manager = self.db.skiplist.transaction_manager();
             let tx = tx_manager.begin();
 
-            let result = self.db.skiplist.remove(key, &tx).await;
+            let result = self.db.skiplist.remove(key, &tx).await?;
 
             let key_clone = key.clone();
             let on_pre_commit = || {
@@ -971,7 +971,7 @@ where
                         .await;
                 }
                 None => {
-                    self.db.skiplist.remove(key, &active_tx).await;
+                    self.db.skiplist.remove(key, &active_tx).await?;
                 }
             }
         }
@@ -1447,7 +1447,7 @@ where
             let tx = tx_manager.begin();
 
             // Provisionally apply the remove.
-            let result = self.skiplist.remove(key, &tx).await;
+            let result = self.skiplist.remove(key, &tx).await?;
 
             // Define the pre-commit hook for WAL logging.
             let key_clone = key.clone();
@@ -1687,7 +1687,7 @@ where
                         .await;
                 }
                 None => {
-                    self.skiplist.remove(key, &active_tx).await;
+                    self.skiplist.remove(key, &active_tx).await?;
                 }
             }
         }

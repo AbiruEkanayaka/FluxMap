@@ -615,7 +615,7 @@ where
                                 let _ = skiplist.insert(key, val, &tx).await;
                             }
                             None => {
-                                skiplist.remove(&key, &tx).await;
+                                let _ = skiplist.remove(&key, &tx).await;
                             }
                         }
                     }

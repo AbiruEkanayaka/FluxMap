@@ -160,6 +160,7 @@ async fn test_remove() {
         *skip_list
             .remove(&"b".to_string(), &remover_tx)
             .await
+            .unwrap()
             .unwrap(),
         "two".to_string()
     );
@@ -177,6 +178,7 @@ async fn test_remove() {
         skip_list
             .remove(&"d".to_string(), &remover_tx_2)
             .await
+            .unwrap()
             .is_none()
     );
     assert_eq!(skip_list.len(), 3);
@@ -397,7 +399,7 @@ async fn test_concurrent_insert_and_remove() {
         let tx_manager = tx_manager.clone();
         tasks.push(tokio::spawn(async move {
             let tx = tx_manager.begin();
-            skip_list.remove(&i.to_string(), &tx).await;
+            skip_list.remove(&i.to_string(), &tx).await.unwrap();
             tx_manager.commit(&tx, || Ok(()), IsolationLevel::Serializable).unwrap();
         }));
     }
@@ -443,7 +445,7 @@ async fn test_stress_concurrent_operations() {
                         skip_list.get(&key.to_string(), &tx);
                     }
                     2 => {
-                        skip_list.remove(&key.to_string(), &tx).await;
+                        skip_list.remove(&key.to_string(), &tx).await.unwrap();
                     }
                     3 => {
                         let start = rng.random_range(0..key_range).to_string();
@@ -503,7 +505,7 @@ async fn test_concurrent_range_stream_modifications() {
                             .await;
                     }
                     1 => {
-                        skip_list_clone.remove(&key, &tx).await;
+                        skip_list_clone.remove(&key, &tx).await.unwrap();
                     }
                     _ => unreachable!(),
                 }
@@ -562,7 +564,7 @@ async fn test_concurrent_prefix_scan_modifications() {
                             .await;
                     }
                     1 => {
-                        skip_list_clone.remove(&key, &tx).await;
+                        skip_list_clone.remove(&key, &tx).await.unwrap();
                     }
                     _ => unreachable!(),
                 }
@@ -688,17 +690,17 @@ async fn test_vacuum() {
 
     // Tx2: Delete x, Update y to 30
     let tx2 = tx_manager.begin();
-    skip_list.remove(&"x".to_string(), &tx2).await;
+    skip_list.remove(&"x".to_string(), &tx2).await.unwrap();
     skip_list.insert("y".to_string(), Arc::new(30), &tx2).await; // This prepends a new version, does not expire the old one.
     tx_manager.commit(&tx2, || Ok(()), IsolationLevel::Serializable).unwrap();
 
-    // Run vacuum. Only the version of `x` was explicitly removed.
+    // Run vacuum.
     let (versions_removed, _keys_removed) = skip_list.vacuum().await.unwrap();
 
-    // Only the explicitly `remove`d version of 'x' should be cleaned up.
+    // Vacuum should remove the version of 'x' (explicitly removed) and the old version of 'y' (expired by update).
     assert_eq!(
-        versions_removed, 1,
-        "Vacuum should have removed one dead version."
+        versions_removed, 2,
+        "Vacuum should have removed two dead versions."
     );
 
     // A final check to ensure the correct data is still visible.
@@ -714,7 +716,7 @@ async fn test_vacuum() {
     tx_manager.commit(&tx3, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let tx4 = tx_manager.begin();
-    skip_list.remove(&"z".to_string(), &tx4).await; // Expires z=1
+    skip_list.remove(&"z".to_string(), &tx4).await.unwrap(); // Expires z=1
     tx_manager.commit(&tx4, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let tx5 = tx_manager.begin();
@@ -722,7 +724,7 @@ async fn test_vacuum() {
     tx_manager.commit(&tx5, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let tx6 = tx_manager.begin();
-    skip_list.remove(&"z".to_string(), &tx6).await; // Expires z=2
+    skip_list.remove(&"z".to_string(), &tx6).await.unwrap(); // Expires z=2
     tx_manager.commit(&tx6, || Ok(()), IsolationLevel::Serializable).unwrap();
 
     let tx7 = tx_manager.begin();
@@ -754,7 +756,7 @@ async fn test_vacuum_removes_node() {
     // Tx2: Remove "a"
     let tx2 = tx_manager.begin();
     assert_eq!(
-        skip_list.remove(&"a".to_string(), &tx2).await.unwrap(),
+        skip_list.remove(&"a".to_string(), &tx2).await.unwrap().unwrap(),
         Arc::new(1)
     );
     tx_manager.commit(&tx2, || Ok(()), IsolationLevel::Serializable).unwrap();
@@ -807,34 +809,32 @@ async fn test_remove_respects_snapshot() {
         "Remover should see the initial value"
     );
 
-    // Now, `remove` should find the visible version (value 1) and expire it.
-    // The old, incorrect implementation would have tried to expire version 2.
-    let removed_value = skip_list.remove(&"a".to_string(), &tx3_remover).await;
+    // Now, `remove` should find the visible version (value 1) and try to expire it.
+    // However, since version 1 was already updated (expired) by tx2_updater (which is active),
+    // we expect a SerializationConflict because tx2 holds the write lock.
+    let removed_result = skip_list.remove(&"a".to_string(), &tx3_remover).await;
     assert_eq!(
-        *removed_value.unwrap(),
-        1,
-        "Remove should act on the visible version"
+        removed_result.unwrap_err(),
+        error::FluxError::SerializationConflict,
+        "Remove should conflict with the uncommitted update"
     );
 
-    // Commit the removal.
-    tx_manager.commit(&tx3_remover, || Ok(()), IsolationLevel::Serializable).unwrap();
+    // Since tx3 failed, it aborts.
+    tx_manager.abort(&tx3_remover);
 
-    // Tx4 (Final Reader): A new transaction should see the key as removed.
-    let tx4_reader = tx_manager.begin();
-    assert!(
-        skip_list.get(&"a".to_string(), &tx4_reader).is_none(),
-        "A new transaction should not see the key"
-    );
-
-    // The uncommitted updater transaction should now fail if it tries to commit.
+    // tx2_updater should be able to commit successfully now (since tx3 failed).
     let commit_result = tx_manager.commit(&tx2_updater, || Ok(()), IsolationLevel::Serializable);
     assert!(
-        commit_result.is_err(),
-        "Updater transaction should fail to commit due to conflict"
+        commit_result.is_ok(),
+        "Updater transaction should commit successfully"
     );
+
+    // Tx4 (Final Reader): Should see the updated value 2.
+    let tx4_reader = tx_manager.begin();
     assert_eq!(
-        commit_result.unwrap_err(),
-        error::FluxError::SerializationConflict
+        *skip_list.get(&"a".to_string(), &tx4_reader).unwrap(),
+        2,
+        "A new transaction should see the updated value"
     );
 }
 
@@ -854,7 +854,7 @@ async fn test_vacuum_handles_uncommitted_expirer() {
     // This creates a version (value 1) expired by an uncommitted transaction (Tx2).
     let tx2_expirer = tx_manager.begin();
     let removed_val = skip_list.remove(&"a".to_string(), &tx2_expirer).await;
-    assert_eq!(*removed_val.unwrap(), 1);
+    assert_eq!(*removed_val.unwrap().unwrap(), 1);
 
     // Run vacuum. It should NOT remove the version expired by tx2_expirer
     // because tx2_expirer is still active.

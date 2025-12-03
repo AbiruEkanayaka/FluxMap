@@ -15,7 +15,7 @@
 //!     chain. When a value is deleted, the most recent `VersionNode` is marked as
 
 use crate::mem::{EvictionPolicy, MemSize};
-pub use crate::transaction::{Snapshot, Transaction, TransactionManager, TxId, Version};
+use crate::transaction::{Transaction, TransactionManager, Version, TransactionStatus};
 use crossbeam_epoch::{Atomic, Guard, Shared};
 use crossbeam_utils::CachePadded;
 use dashmap::DashSet;
@@ -1070,7 +1070,11 @@ where
     /// # Returns
     ///
     /// Returns the value that was removed if a visible version was found, otherwise `None`.
-    pub async fn remove(&self, key: &K, transaction: &Transaction<K, V>) -> Option<Arc<V>> {
+    pub async fn remove(
+        &self,
+        key: &K,
+        transaction: &Transaction<K, V>,
+    ) -> Result<Option<Arc<V>>, crate::error::FluxError> {
         transaction.write_set.insert(key.clone());
         let transaction_id = transaction.id;
 
@@ -1092,12 +1096,12 @@ where
                 node.key.as_ref().unwrap_unchecked()
             } != key
             {
-                return None; // Key not found.
+                return Ok(None); // Key not found.
             }
 
             // If the node is already marked as deleted by the vacuum, we can't do anything.
             if node.deleted.load(Ordering::Acquire) {
-                return None;
+                return Ok(None);
             }
 
             let mut version_ptr = node.value.load(Ordering::Acquire, guard);
@@ -1112,22 +1116,40 @@ where
                     .is_visible(&version_node.version, &*self.tx_manager);
 
                 if is_visible {
-                    // This is a version we can try to expire.
-                    // Atomically set the expirer_txid from 0 to our transaction ID.
-                    match version_node.version.expirer_txid.compare_exchange(
-                        0,
-                        transaction_id,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => {
-                            // Success! We expired this version.
-                            return Some(version_node.version.value.clone());
-                        }
-                        Err(_) => {
-                            // CAS failed. Another concurrent transaction just expired it.
-                            // This version is no longer visible to us.
-                            // We continue the loop to find the next visible version.
+                    let mut current_expirer = version_node.version.expirer_txid.load(Ordering::Acquire);
+                    loop {
+                        if current_expirer == 0 {
+                            match version_node.version.expirer_txid.compare_exchange(
+                                0,
+                                transaction_id,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            ) {
+                                Ok(_) => return Ok(Some(version_node.version.value.clone())),
+                                Err(actual) => {
+                                    current_expirer = actual;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            // Check if aborted
+                            if let Some(TransactionStatus::Aborted) = self.tx_manager.get_status(current_expirer) {
+                                match version_node.version.expirer_txid.compare_exchange(
+                                    current_expirer,
+                                    transaction_id,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                ) {
+                                    Ok(_) => return Ok(Some(version_node.version.value.clone())),
+                                    Err(actual) => {
+                                        current_expirer = actual;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                // It is Active or Committed. Conflict.
+                                return Err(crate::error::FluxError::SerializationConflict);
+                            }
                         }
                     }
                 }
@@ -1137,9 +1159,9 @@ where
             }
 
             // If we reach here, no visible version was found or we lost all races.
-            return None;
+            return Ok(None);
         } else {
-            return None; // Node not found.
+            return Ok(None); // Node not found.
         }
     }
 
