@@ -781,6 +781,364 @@ where
             fatal_error: &self.fatal_error,
         }
     }
+
+    /// Creates a new `OwnedHandle` for interacting with the database.
+    ///
+    /// Unlike `Handle`, `OwnedHandle` owns an `Arc` to the database and is `Send` + `Sync`.
+    /// This makes it suitable for long-lived transactions or passing across threads/tasks.
+    pub fn owned_handle(self: &Arc<Self>) -> OwnedHandle<K, V> {
+        OwnedHandle {
+            db: self.clone(),
+            active_tx: None,
+        }
+    }
+}
+
+/// A thread-safe, owned handle to the database.
+///
+/// This provides the same functionality as `Handle` but holds an `Arc<Database>`
+/// internally, making it `'static` and `Send`.
+pub struct OwnedHandle<K, V>
+where
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + Hash
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + MemSize
+        + Borrow<str>,
+    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
+{
+    db: Arc<Database<K, V>>,
+    active_tx: Option<Arc<Transaction<K, V>>>,
+}
+
+impl<K, V> OwnedHandle<K, V>
+where
+    K: Ord
+        + Clone
+        + Send
+        + Sync
+        + 'static
+        + Hash
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + MemSize
+        + Borrow<str>,
+    V: Clone + Send + Sync + 'static + Serialize + DeserializeOwned + MemSize,
+{
+    fn check_fatal_error(&self) -> Result<(), FluxError> {
+        if let Some(err_msg) = self.db.fatal_error.lock().unwrap().as_ref() {
+            return Err(FluxError::FatalPersistenceError(err_msg.clone()));
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, key: &K) -> Result<Option<Arc<V>>, FluxError> {
+        self.check_fatal_error()?;
+        if let Some(active_tx) = &self.active_tx {
+            let workspace = active_tx.workspace.read().unwrap();
+            if let Some(workspace_value) = workspace.get(key.borrow()) {
+                return Ok(workspace_value.clone());
+            }
+            Ok(self.db.skiplist.get(key, active_tx))
+        } else {
+            let tx_manager = self.db.skiplist.transaction_manager();
+            let tx = tx_manager.begin();
+            let result = self.db.skiplist.get(key, &tx);
+            if let (Some(manager), Some(_)) = (&self.db.arc_manager, &result) {
+                manager.hit(key);
+            }
+            tx_manager.commit(&tx, || Ok(()), self.db.isolation_level)?;
+            Ok(result)
+        }
+    }
+
+    pub async fn insert(&self, key: K, value: V) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
+        if let Some(active_tx) = &self.active_tx {
+            active_tx
+                .workspace
+                .write()
+                .unwrap()
+                .insert(key, Some(Arc::new(value)));
+            Ok(())
+        } else {
+            let tx_manager = self.db.skiplist.transaction_manager();
+            let tx = tx_manager.begin();
+
+            let key_for_eviction = key.clone();
+            let allocated_size = self
+                .db
+                .skiplist
+                .insert(key.clone(), Arc::new(value.clone()), &tx)
+                .await;
+
+            let on_pre_commit = || {
+                if let Some(engine) = &self.db.persistence_engine {
+                    let mut workspace = crate::transaction::Workspace::new();
+                    workspace.insert(key, Some(Arc::new(value)));
+                    let mut serialized_data = Vec::new();
+                    ciborium::into_writer(&workspace, &mut serialized_data).map_err(|e| {
+                        FluxError::Persistence(PersistenceError::Serialization(e.to_string()))
+                    })?;
+                    engine.log(&serialized_data)?;
+                }
+                Ok(())
+            };
+
+            match tx_manager.commit(&tx, on_pre_commit, self.db.isolation_level) {
+                Ok(()) => {
+                    if let Some(manager) = &self.db.arc_manager {
+                        manager.miss(key_for_eviction.clone(), allocated_size as usize);
+                    }
+                    self.db.evict_if_needed(Some(&key_for_eviction)).await;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    pub async fn remove(&self, key: &K) -> Result<Option<Arc<V>>, FluxError> {
+        self.check_fatal_error()?;
+        if let Some(active_tx) = &self.active_tx {
+            let mut workspace = active_tx.workspace.write().unwrap();
+            let old_val_in_workspace = workspace.insert(key.clone(), None);
+            if let Some(Some(val)) = old_val_in_workspace {
+                Ok(Some(val))
+            } else {
+                Ok(self.db.skiplist.get(key, active_tx))
+            }
+        } else {
+            let tx_manager = self.db.skiplist.transaction_manager();
+            let tx = tx_manager.begin();
+
+            let result = self.db.skiplist.remove(key, &tx).await;
+
+            let key_clone = key.clone();
+            let on_pre_commit = || {
+                if let Some(engine) = &self.db.persistence_engine {
+                    let mut workspace: crate::transaction::Workspace<K, V> =
+                        crate::transaction::Workspace::new();
+                    workspace.insert(key_clone, None);
+                    let mut serialized_data = Vec::new();
+                    ciborium::into_writer(&workspace, &mut serialized_data).map_err(|e| {
+                        FluxError::Persistence(PersistenceError::Serialization(e.to_string()))
+                    })?;
+                    engine.log(&serialized_data)?;
+                }
+                Ok(())
+            };
+
+            match tx_manager.commit(&tx, on_pre_commit, self.db.isolation_level) {
+                Ok(()) => Ok(result),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    pub fn begin(&mut self) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
+        if self.active_tx.is_some() {
+            return Err(FluxError::TransactionAlreadyActive);
+        }
+        let tx_manager = self.db.skiplist.transaction_manager();
+        let tx = tx_manager.begin();
+        self.active_tx = Some(tx);
+        Ok(())
+    }
+
+    pub async fn commit(&mut self) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
+        let active_tx = self
+            .active_tx
+            .take()
+            .ok_or(FluxError::NoActiveTransaction)?;
+
+        let workspace = active_tx.workspace.read().unwrap().clone();
+        for (key, value) in workspace.iter() {
+            match value {
+                Some(val) => {
+                    self.db
+                        .skiplist
+                        .insert(key.clone(), val.clone(), &active_tx)
+                        .await;
+                }
+                None => {
+                    self.db.skiplist.remove(key, &active_tx).await;
+                }
+            }
+        }
+
+        let tx_manager = self.db.skiplist.transaction_manager();
+        let persistence_engine = &self.db.persistence_engine;
+
+        let on_pre_commit = || {
+            if let Some(engine) = persistence_engine {
+                if !workspace.is_empty() {
+                    let mut serialized_data = Vec::new();
+                    ciborium::into_writer(&workspace, &mut serialized_data).map_err(|e| {
+                        FluxError::Persistence(PersistenceError::Serialization(e.to_string()))
+                    })?;
+                    engine.log(&serialized_data)?;
+                }
+            }
+            Ok(())
+        };
+
+        match tx_manager.commit(&active_tx, on_pre_commit, self.db.isolation_level) {
+            Ok(()) => {
+                self.db.evict_if_needed(None).await;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn rollback(&mut self) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
+        let active_tx = self
+            .active_tx
+            .take()
+            .ok_or(FluxError::NoActiveTransaction)?;
+
+        let tx_manager = self.db.skiplist.transaction_manager();
+        tx_manager.abort(&active_tx);
+        Ok(())
+    }
+
+    pub fn savepoint(&mut self, name: &str) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
+        let active_tx = self
+            .active_tx
+            .as_ref()
+            .ok_or(FluxError::NoActiveTransaction)?;
+
+        let workspace = active_tx.workspace.read().unwrap();
+        let mut savepoints = active_tx.savepoints.write().unwrap();
+
+        savepoints.push((name.to_string(), workspace.clone()));
+        Ok(())
+    }
+
+    pub fn rollback_to(&mut self, name: &str) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
+        let active_tx = self
+            .active_tx
+            .as_ref()
+            .ok_or(FluxError::NoActiveTransaction)?;
+
+        let mut savepoints = active_tx.savepoints.write().unwrap();
+        if let Some(pos) = savepoints.iter().rposition(|(sp_name, _)| sp_name == name) {
+            let (_, saved_workspace) = savepoints[pos].clone();
+            let mut current_workspace = active_tx.workspace.write().unwrap();
+            *current_workspace = saved_workspace;
+            savepoints.truncate(pos);
+            Ok(())
+        } else {
+            Err(FluxError::SavepointNotFound(name.to_string()))
+        }
+    }
+
+    pub fn release_savepoint(&mut self, name: &str) -> Result<(), FluxError> {
+        self.check_fatal_error()?;
+        let active_tx = self
+            .active_tx
+            .as_ref()
+            .ok_or(FluxError::NoActiveTransaction)?;
+
+        let mut savepoints = active_tx.savepoints.write().unwrap();
+        if let Some(pos) = savepoints.iter().rposition(|(sp_name, _)| sp_name == name) {
+            savepoints.remove(pos);
+            Ok(())
+        } else {
+            Err(FluxError::SavepointNotFound(name.to_string()))
+        }
+    }
+
+    pub fn prefix_scan(&self, prefix: &str) -> Result<Vec<(K, Arc<V>)>, FluxError> {
+        self.check_fatal_error()?;
+        if let Some(active_tx) = &self.active_tx {
+            active_tx
+                .prefix_scans
+                .write()
+                .unwrap()
+                .push(prefix.to_string());
+
+            let mut results: BTreeMap<K, Arc<V>> = self
+                .db
+                .skiplist
+                .prefix_scan(prefix, active_tx)
+                .into_iter()
+                .collect();
+
+            let workspace = active_tx.workspace.read().unwrap();
+            for (key, value) in workspace.iter() {
+                if key.borrow().starts_with(prefix) {
+                    match value {
+                        Some(v) => {
+                            results.insert(key.clone(), v.clone());
+                        }
+                        None => {
+                            results.remove(key.borrow());
+                        }
+                    }
+                }
+            }
+            Ok(results.into_iter().collect())
+        } else {
+            let tx_manager = self.db.skiplist.transaction_manager();
+            let tx = tx_manager.begin();
+            let results = self.db.skiplist.prefix_scan(prefix, &tx);
+            tx_manager.commit(&tx, || Ok(()), self.db.isolation_level)?;
+            Ok(results)
+        }
+    }
+
+    pub fn range(&self, start: &K, end: &K) -> Result<Vec<(K, Arc<V>)>, FluxError> {
+        self.check_fatal_error()?;
+        if let Some(active_tx) = &self.active_tx {
+            active_tx
+                .range_scans
+                .write()
+                .unwrap()
+                .push((start.clone(), end.clone()));
+
+            let mut results: BTreeMap<K, Arc<V>> = self
+                .db
+                .skiplist
+                .range(start, end, active_tx)
+                .into_iter()
+                .collect();
+
+            let workspace = active_tx.workspace.read().unwrap();
+            for (key, value) in workspace.iter() {
+                if key >= start && key <= end {
+                    match value {
+                        Some(v) => {
+                            results.insert(key.clone(), v.clone());
+                        }
+                        None => {
+                            results.remove(key.borrow());
+                        }
+                    }
+                }
+            }
+            Ok(results.into_iter().collect())
+        } else {
+            let tx_manager = self.db.skiplist.transaction_manager();
+            let tx = tx_manager.begin();
+            let results = self.db.skiplist.range(start, end, &tx);
+            tx_manager.commit(&tx, || Ok(()), self.db.isolation_level)?;
+            Ok(results)
+        }
+    }
 }
 
 /// A handle to the database, representing a single client session.

@@ -596,8 +596,9 @@ where
                         let new_version_node_shared =
                             Shared::from(version_node_ptr as *const VersionNode<Arc<V>>);
 
-                        loop {
+                        let loop_result = loop {
                             let current_head_ptr = next_node.value.load(Ordering::Acquire, guard);
+                            
                             unsafe {
                                 // SAFETY: `new_version_node_shared` is a valid `Shared` pointer.
                                 // `deref()` is safe. We are setting its `next` pointer to the current
@@ -619,7 +620,21 @@ where
                                 Ok(_) => break (InsertAction::Return, version_size), // Success
                                 Err(_) => continue, // Contention, retry CAS loop
                             }
+                        };
+                        
+                        // Expire the old version (which is now next)
+                        let next_version_ptr = unsafe { new_version_node_shared.deref().next.load(Ordering::Relaxed, guard) };
+                        if let Some(old_head) = unsafe { next_version_ptr.as_ref() } {
+                             let _ = old_head.version.expirer_txid.compare_exchange(
+                                0,
+                                transaction.id,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
                         }
+                        
+                        loop_result
+
                     } else {
                         // Key does not exist, create a new node.
                         transaction.insert_set.insert(key.clone());
