@@ -839,6 +839,11 @@ where
         Ok(())
     }
 
+    /// Returns the ID of the currently active transaction, or 0 if no transaction is active.
+    pub fn id(&self) -> crate::transaction::TxId {
+        self.active_tx.as_ref().map(|tx| tx.id).unwrap_or(0)
+    }
+
     pub fn get(&self, key: &K) -> Result<Option<Arc<V>>, FluxError> {
         self.check_fatal_error()?;
         if let Some(active_tx) = &self.active_tx {
@@ -1261,6 +1266,11 @@ where
             return Err(FluxError::FatalPersistenceError(err_msg.clone()));
         }
         Ok(())
+    }
+
+    /// Returns the ID of the currently active transaction, or 0 if no transaction is active.
+    pub fn id(&self) -> crate::transaction::TxId {
+        self.active_tx.as_ref().map(|tx| tx.id).unwrap_or(0)
     }
 
     /// Retrieves a value from the database.
